@@ -1,0 +1,20 @@
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Folders to ignore
+data_cache/
+reports/
+models/
+
+# Environment files
+.env
+venv/
+
+# IDE configuration files
+.vscode/
+.idea/

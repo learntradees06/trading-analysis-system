@@ -1,0 +1,10 @@
+pandas
+yfinance
+scikit-learn
+plotly
+jinja2
+requests
+numpy
+pytz
+scipy
+ta
