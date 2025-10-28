@@ -103,6 +103,11 @@ class StatisticalAnalyzer:
                     'count': len(day_results),
                     'stats': stats
                 }
+                # Add a warning for small sample sizes
+                MIN_SAMPLES = 5 # Or get this from config
+                if len(day_results) < MIN_SAMPLES:
+                    # You could add a 'warning' key to the results dictionary
+                    statistics[opening_type]['warning'] = f"Warning: Statistics based on only {len(day_results)} samples."
             else:
                 # No data for this opening type
                 statistics[opening_type] = {

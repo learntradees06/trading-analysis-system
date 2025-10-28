@@ -454,7 +454,7 @@ class ReportGenerator:
         
         # Save report
         report_path = self.reports_dir / f"{self.ticker}_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-        with open(report_path, 'w') as f:
+        with open(report_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         
         return str(report_path)
