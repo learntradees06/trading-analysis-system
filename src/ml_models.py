@@ -4,7 +4,7 @@
 
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
@@ -61,21 +61,33 @@ class MLPredictor:
         self.model_configs = {
             'target_broke_ibh': {
                 'type': 'binary',
+                'objective': 'binary:logistic',
+                'eval_metric': 'logloss',
                 'n_estimators': 100,
-                'max_depth': 10,
-                'min_samples_split': 5
+                'max_depth': 6,
+                'learning_rate': 0.1,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8
             },
             'target_broke_ibl': {
                 'type': 'binary',
+                'objective': 'binary:logistic',
+                'eval_metric': 'logloss',
                 'n_estimators': 100,
-                'max_depth': 10,
-                'min_samples_split': 5
+                'max_depth': 6,
+                'learning_rate': 0.1,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8
             },
             'target_next_day_direction': {
                 'type': 'multiclass',
+                'objective': 'multi:softprob',
+                'eval_metric': 'mlogloss',
                 'n_estimators': 150,
-                'max_depth': 12,
-                'min_samples_split': 5,
+                'max_depth': 8,
+                'learning_rate': 0.05,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
                 'classes': ['Strong Down', 'Mod Down', 'Chop', 'Mod Up', 'Strong Up']
             }
         }
@@ -376,10 +388,15 @@ class MLPredictor:
             X_test_scaled = self.scalers[target].transform(X_test)
 
             # Train model
-            model = RandomForestClassifier(
+            model = xgb.XGBClassifier(
+                objective=config['objective'],
                 n_estimators=config['n_estimators'],
                 max_depth=config['max_depth'],
-                min_samples_split=config['min_samples_split'],
+                learning_rate=config['learning_rate'],
+                subsample=config['subsample'],
+                colsample_bytree=config['colsample_bytree'],
+                eval_metric=config['eval_metric'],
+                use_label_encoder=False,
                 random_state=42,
                 n_jobs=-1
             )

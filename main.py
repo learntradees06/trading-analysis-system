@@ -146,33 +146,41 @@ class TradingSystem:
             print("📈 Calculating technical indicators...")
             daily_with_indicators = calculate_all_indicators(daily_data)
 
-            # Generate market profiles
+            # --- START REPLACEMENT ---
             print("📊 Analyzing market profiles...")
             profiles = []
             intraday_data_dict = {}
 
-            # Get a list of unique dates present in the 30-min data
-            unique_days = thirty_min_data.index.normalize().unique()
+            # Get unique DATE objects from each index
+            unique_dates_30m = {ts.date() for ts in thirty_min_data.index}
+            unique_dates_daily = {ts.date() for ts in daily_data.index}
 
-            # Filter to match the dates available in the daily data for context
-            relevant_days = [d for d in unique_days if d in daily_data.index]
+            # Find the intersection of the two sets of dates
+            relevant_dates = sorted(list(unique_dates_30m.intersection(unique_dates_daily)))
 
-            for date in relevant_days:
-                # Get RTH data for this date
-                day_data = thirty_min_data[thirty_min_data.index.date == date.date()]
+            for date_obj in relevant_dates:
+                # Get RTH data for this specific date
+                day_data = thirty_min_data[thirty_min_data.index.date == date_obj]
+
+                # We also need the original timestamp from the daily data for the profile
+                # Find the first timestamp in daily_data that matches this date
+                # We explicitly convert the index to a DatetimeIndex to safely access the .date property
+                matching_daily_timestamp = daily_data[pd.to_datetime(daily_data.index, utc=True).date == date_obj].index[0]
+
                 if not day_data.empty:
                     rth_data = self.data_manager.get_rth_data(day_data)
                     if not rth_data.empty:
-                        profile = self.market_profile.calculate_tpo_profile(rth_data, date)
+                        profile = self.market_profile.calculate_tpo_profile(rth_data, matching_daily_timestamp) # Use the timestamp here
                         if profile:
                             # Add opening type classification
-                            if profiles:  # Need prior profile
+                            if profiles: # Need prior profile
                                 profile['opening_type'] = self.market_profile.classify_opening_type(
                                     rth_data['Open'].iloc[0] if not rth_data.empty else 0,
                                     profiles[-1]
                                 )
                             profiles.append(profile)
-                            intraday_data_dict[date] = rth_data
+                            intraday_data_dict[matching_daily_timestamp] = rth_data # Use the timestamp as key
+            # --- END REPLACEMENT ---
 
             # Calculate statistics
             print("📊 Calculating historical statistics...")
@@ -198,20 +206,24 @@ class TradingSystem:
             # --- START REPLACEMENT ---
             ml_predictions = {}
             models_to_check = ['target_broke_ibh', 'target_broke_ibl', 'target_next_day_direction']
+
+            # Check if models exist on disk.
             missing_models = [target for target in models_to_check if not self.ml_predictor.model_exists(target)]
 
+            # If they don't exist, train them. The trained models will be loaded into memory.
             if missing_models:
                 print(f"⚠️ Models not found: {', '.join(missing_models)}. Training models now...")
                 self.train_ml_models()
+            else:
+                # If they exist on disk, load them into memory.
+                all(self.ml_predictor.load_model(target) for target in models_to_check)
 
-            # Always try to load models after checking, in case they were just trained
-            all_models_loaded = all(self.ml_predictor.load_model(target) for target in models_to_check)
-
-            if all_models_loaded and ml_features is not None and not ml_features.empty:
+            # Now that models are in memory (either from training or loading), run prediction.
+            if ml_features is not None and not ml_features.empty:
                 print("🤖 Running ML predictions...")
                 ml_predictions = self.ml_predictor.predict(ml_features)
             else:
-                print("🤖 Skipping ML predictions as models are not ready.")
+                print("🤖 Skipping ML predictions due to no features.")
             # --- END REPLACEMENT ---
 
             # Generate trading signal

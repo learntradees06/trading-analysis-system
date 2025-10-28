@@ -8,3 +8,4 @@ numpy
 pytz
 scipy
 ta
+xgboost
