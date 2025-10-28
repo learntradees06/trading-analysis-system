@@ -191,52 +191,32 @@ class DataManager:
         """Download all available historical data for a timeframe"""
         yf_interval = self.TIMEFRAME_MAPPING.get(timeframe, '1d')
 
-        try:
-            # For daily and higher timeframes, get all available data
-            if timeframe in ['1d', '1wk']:
-                logger.info(f"Downloading complete history for {self.ticker} {timeframe}")
-                df = self.yf_ticker.history(period="max", interval=yf_interval, auto_adjust=False)
-            else:
-                # For intraday, get maximum allowed
-                max_days = self._get_max_days_for_timeframe(timeframe)
-                logger.info(f"Downloading {max_days} days of {timeframe} data for {self.ticker}")
-
-                # Try different approaches for better data
-                if max_days <= 60:
-                    # Use days for short periods
-                    df = self.yf_ticker.history(period=f"{max_days}d", interval=yf_interval, auto_adjust=False)
-                else:
-                    # Use months for longer periods
-                    months = max_days // 30
-                    df = self.yf_ticker.history(period=f"{months}mo", interval=yf_interval, auto_adjust=False)
-
-            if df.empty:
-                # Fallback to download method
-                logger.info("Trying alternative download method...")
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=self._get_max_days_for_timeframe(timeframe))
-                df = self.yf_ticker.history(start=start_date, end=end_date, interval=yf_interval, auto_adjust=False)
-
-            # Handle 4h aggregation
-            if timeframe == '4h' and not df.empty:
-                df = self._aggregate_to_4h(df)
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Error downloading data: {e}")
-            logger.info("Trying a shorter period...")
+        # For daily and higher timeframes, get all available data
+        if timeframe in ['1d', '1wk']:
+            logger.info(f"Downloading complete history for {self.ticker} {timeframe}")
             try:
-                # Fallback to a shorter period
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=self._get_max_days_for_timeframe(timeframe) // 2)
-                df = self.yf_ticker.history(start=start_date, end=end_date, interval=yf_interval, auto_adjust=False)
-                if timeframe == '4h' and not df.empty:
-                    df = self._aggregate_to_4h(df)
+                df = self.yf_ticker.history(period="max", interval=yf_interval, auto_adjust=False)
                 return df
-            except Exception as e2:
-                logger.error(f"Shorter period also failed: {e2}")
+            except Exception as e:
+                logger.error(f"Error downloading data: {e}")
                 return None
+
+        # For intraday timeframes, try progressively shorter periods
+        periods_to_try = [self._get_max_days_for_timeframe(timeframe), 60, 30, 7]
+        for days in periods_to_try:
+            try:
+                logger.info(f"Downloading {days} days of {timeframe} data for {self.ticker}")
+                df = self.yf_ticker.history(period=f"{days}d", interval=yf_interval, auto_adjust=False)
+                if not df.empty:
+                    if timeframe == '4h':
+                        df = self._aggregate_to_4h(df)
+                    return df
+            except Exception as e:
+                logger.warning(f"Could not download {days} days of {timeframe} data: {e}")
+                continue
+
+        logger.error(f"All download attempts failed for {self.ticker} {timeframe}")
+        return None
 
     def _download_incremental_data(self, timeframe: str, days_back: int) -> Optional[pd.DataFrame]:
         """Download only new/missing data to append to cache"""
@@ -712,6 +692,7 @@ class DataManager:
             DELETE FROM ohlcv_data
             WHERE ticker = ? AND timeframe IN ('1m', '5m') AND timestamp < ?
         ''', (self.ticker, one_year_ago))
+        self.conn.commit()
 
         # Vacuum to reclaim space
         cursor.execute('VACUUM')
