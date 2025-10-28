@@ -225,7 +225,18 @@ class DataManager:
 
         except Exception as e:
             logger.error(f"Error downloading data: {e}")
-            return None
+            logger.info("Trying a shorter period...")
+            try:
+                # Fallback to a shorter period
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=self._get_max_days_for_timeframe(timeframe) // 2)
+                df = self.yf_ticker.history(start=start_date, end=end_date, interval=yf_interval, auto_adjust=False)
+                if timeframe == '4h' and not df.empty:
+                    df = self._aggregate_to_4h(df)
+                return df
+            except Exception as e2:
+                logger.error(f"Shorter period also failed: {e2}")
+                return None
 
     def _download_incremental_data(self, timeframe: str, days_back: int) -> Optional[pd.DataFrame]:
         """Download only new/missing data to append to cache"""
@@ -315,16 +326,20 @@ class DataManager:
 
         # Standardize both to UTC
         if not existing.empty:
-            if existing.index.tz is not None:
-                existing = existing.tz_convert('UTC')
-            else:
+            if not isinstance(existing.index, pd.DatetimeIndex):
+                existing.index = pd.to_datetime(existing.index, utc=True)
+            if existing.index.tz is None:
                 existing = existing.tz_localize('UTC')
+            else:
+                existing = existing.tz_convert('UTC')
 
         if not new.empty:
-            if new.index.tz is not None:
-                new = new.tz_convert('UTC')
-            else:
+            if not isinstance(new.index, pd.DatetimeIndex):
+                new.index = pd.to_datetime(new.index, utc=True)
+            if new.index.tz is None:
                 new = new.tz_localize('UTC')
+            else:
+                new = new.tz_convert('UTC')
 
         # Combine dataframes
         combined = pd.concat([existing, new])

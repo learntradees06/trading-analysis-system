@@ -197,15 +197,16 @@ class TradingSystem:
 
             # --- START REPLACEMENT ---
             ml_predictions = {}
-            all_models_loaded = True
+            models_to_check = ['target_broke_ibh', 'target_broke_ibl', 'target_next_day_direction']
+            missing_models = [target for target in models_to_check if not self.ml_predictor.model_exists(target)]
 
-            # Try to load all required models
-            for target in ['target_broke_ibh', 'target_broke_ibl', 'target_next_day_direction']:
-                if not self.ml_predictor.load_model(target):
-                    print(f"⚠️ Warning: ML model for '{target}' not found. Run training (Option 5).")
-                    all_models_loaded = False
+            if missing_models:
+                print(f"⚠️ Models not found: {', '.join(missing_models)}. Training models now...")
+                self.train_ml_models()
 
-            # Only predict if models were loaded and features exist
+            # Always try to load models after checking, in case they were just trained
+            all_models_loaded = all(self.ml_predictor.load_model(target) for target in models_to_check)
+
             if all_models_loaded and ml_features is not None and not ml_features.empty:
                 print("🤖 Running ML predictions...")
                 ml_predictions = self.ml_predictor.predict(ml_features)
