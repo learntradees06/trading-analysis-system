@@ -321,6 +321,8 @@ class MLPredictor:
                     self.label_encoders[target] = LabelEncoder()
                     y = self.label_encoders[target].fit_transform(df[target])
                 else:
+                    # Handle unseen labels during prediction
+                    df[target] = df[target].fillna(self.label_encoders[target].classes_[0])
                     y = self.label_encoders[target].transform(df[target])
             else:
                 y = df[target]
