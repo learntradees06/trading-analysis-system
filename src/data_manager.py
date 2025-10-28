@@ -674,9 +674,9 @@ class DataManager:
         summary = pd.read_sql_query(query, self.conn, params=(self.ticker,))
 
         if not summary.empty:
-            summary['first_date'] = pd.to_datetime(summary['first_date'])
-            summary['last_date'] = pd.to_datetime(summary['last_date'])
-            summary['last_update'] = pd.to_datetime(summary['last_update'])
+            summary['first_date'] = pd.to_datetime(summary['first_date'], utc=True)
+            summary['last_date'] = pd.to_datetime(summary['last_date'], utc=True)
+            summary['last_update'] = pd.to_datetime(summary['last_update'], utc=True)
             summary['days_covered'] = (summary['last_date'] - summary['first_date']).dt.days
 
         return summary
@@ -757,6 +757,9 @@ def get_cache_statistics():
     ''')
 
     stats = pd.DataFrame(cursor.fetchall(), columns=['ticker', 'rows', 'first_date', 'last_date'])
+    if not stats.empty:
+        stats['first_date'] = pd.to_datetime(stats['first_date'], utc=True)
+        stats['last_date'] = pd.to_datetime(stats['last_date'], utc=True)
 
     # Get database file size
     db_size = Path(DB_PATH).stat().st_size / (1024 * 1024)  # Size in MB
