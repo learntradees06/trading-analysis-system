@@ -29,39 +29,50 @@ class Dashboard:
         table.add_column("RSI", justify="right", style="magenta")
         table.add_column("ADX", justify="right", style="blue")
 
-        # Sort results by score, descending
-        sorted_tickers = sorted(results.keys(), key=lambda t: results[t]['signal'].get('score', 0), reverse=True)
+        # Separate successful and failed analyses
+        successful_results = {t: r for t, r in results.items() if 'error' not in r}
+        failed_results = {t: r for t, r in results.items() if 'error' in r}
 
+        # Sort successful results by score, descending
+        sorted_tickers = sorted(successful_results.keys(), key=lambda t: successful_results[t]['signal'].get('score', 0), reverse=True)
+
+        # Add successful results to the table
         for ticker in sorted_tickers:
-            signal_data = results[ticker].get('signal', {})
-            tech_data = results[ticker].get('technicals', {})
+            result_data = successful_results[ticker]
+            signal_data = result_data.get('signal', {})
+            tech_data = result_data.get('technicals', {})
 
             signal = signal_data.get('signal', 'N/A')
             score = f"{signal_data.get('score', 0):.1f}"
             confidence = signal_data.get('confidence', 'N/A')
-
             evidence = ", ".join(signal_data.get('evidence', []))
-
             rsi = f"{tech_data.get('RSI', 0):.1f}"
             adx = f"{tech_data.get('ADX', 0):.1f}"
 
-            # Color code the signal for better readability
-            if "LONG" in signal:
-                signal_colored = f"[bold green]{signal}[/bold green]"
-            elif "SHORT" in signal:
-                signal_colored = f"[bold red]{signal}[/bold red]"
-            else:
-                signal_colored = f"[bold yellow]{signal}[/bold yellow]"
+            # Color code the signal
+            if "LONG" in signal: signal_colored = f"[bold green]{signal}[/bold green]"
+            elif "SHORT" in signal: signal_colored = f"[bold red]{signal}[/bold red]"
+            else: signal_colored = f"[bold yellow]{signal}[/bold yellow]"
 
-            table.add_row(
-                ticker,
-                signal_colored,
-                score,
-                confidence,
-                evidence,
-                rsi,
-                adx
-            )
+            table.add_row(ticker, signal_colored, score, confidence, evidence, rsi, adx)
+
+        # Add failed results to the table
+        if failed_results:
+            # Add a separator for clarity
+            if successful_results:
+                table.add_row("---", "---", "---", "---", "---", "---", "---")
+
+            for ticker, result_data in failed_results.items():
+                error_message = result_data.get('error', 'Unknown error')
+                table.add_row(
+                    f"[dim]{ticker}[/dim]",
+                    "[bold red]ERROR[/bold red]",
+                    "-",
+                    "-",
+                    f"[dim red]{error_message}[/dim red]",
+                    "-",
+                    "-"
+                )
 
         self.console.print(table)
 

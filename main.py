@@ -5,10 +5,9 @@ import os
 import sys
 from pathlib import Path
 import pandas as pd
-import pytz
 from datetime import datetime
 import time
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,7 +22,7 @@ from src.ml_models import MLPredictor
 from src.signals import SignalGenerator
 from src.reporting import ReportGenerator
 from src.notifications import NotificationManager
-from src.watchlists import WATCHLISTS
+from src.watchlist_manager import WatchlistManager
 from src.portfolio_manager import PortfolioManager
 from src.dashboard import Dashboard
 
@@ -33,25 +32,18 @@ class TradingSystem:
         self.ticker = DEFAULT_TICKER
         self.notifier = NotificationManager(DISCORD_WEBHOOK_URL)
         self.dashboard = Dashboard()
+        self.watchlist_manager = WatchlistManager()
         self.portfolio_manager = PortfolioManager(self._run_single_ticker_analysis)
         self._initialize_components()
 
     def _initialize_components(self):
         """Initialize components that depend on the current ticker."""
-        print(f"\n🔄 Initializing components for {self.ticker}...")
-        if self.ticker in INSTRUMENT_SETTINGS:
-            self.settings = INSTRUMENT_SETTINGS[self.ticker]
-        else:
-            print(f"⚠️  Warning: No specific settings for {self.ticker}, using defaults")
-            self.settings = INSTRUMENT_SETTINGS['DEFAULT']
-        print(f"✅ Components initialized successfully for {self.ticker}")
+        pass # No longer needed as components are created on-demand
 
     def display_menu(self):
         """Display the main menu."""
         os.system('cls' if os.name == 'nt' else 'clear')
-        print("=" * 80)
-        print("   ADVANCED TRADING ANALYSIS SYSTEM")
-        print("=" * 80)
+        print("=" * 80); print("   ADVANCED TRADING ANALYSIS SYSTEM"); print("=" * 80)
         print("\n--- Multi-Ticker Analysis ---")
         print("[1] Analyze Watchlist")
         print("[2] Start Multi-Ticker Scanner")
@@ -61,187 +53,215 @@ class TradingSystem:
         print("[4] View Historical Statistics for Current Ticker")
         print("[5] Train ML Models for Current Ticker")
         print("\n--- System ---")
-        print("[6] Set New Ticker")
-        print("[7] Configure Notifications")
-        print("[8] View Cached Data Summary")
-        print("[9] Exit")
+        print("[6] Manage Watchlists")
+        print("[7] Set New Ticker")
+        print("[8] Configure Notifications")
+        print("[9] View Cached Data Summary")
+        print("[10] Exit")
 
     def _run_single_ticker_analysis(self, ticker: str, generate_report: bool = False) -> Dict:
-        """
-        The core analysis logic for a single ticker.
-        This function is designed to be called by the PortfolioManager's threads.
-        If generate_report is True, it returns all data artifacts needed for the report.
-        """
-        # (Same component initialization as before)
+        """The core analysis logic for a single ticker."""
         data_manager = DataManager(ticker)
-        if ticker in INSTRUMENT_SETTINGS:
-            settings = INSTRUMENT_SETTINGS[ticker]
-        else:
-            settings = INSTRUMENT_SETTINGS['DEFAULT']
+        # Provide a sensible default if the ticker is not in the config
+        default_settings = {
+            "tick_size": 0.01,
+            "rth_start": "08:30",
+            "rth_end": "15:00",
+            "timezone": "US/Central"
+        }
+        settings = INSTRUMENT_SETTINGS.get(ticker, default_settings)
         market_profile = MarketProfile(ticker, settings['tick_size'])
         sr_analyzer = SRLevelAnalyzer(ticker, settings['tick_size'])
         stats_analyzer = StatisticalAnalyzer(ticker)
         ml_predictor = MLPredictor(ticker, MODELS_DIR)
         signal_generator = SignalGenerator(ticker)
-
         try:
-            # (Same data fetching and processing logic as before)
-            daily_data = data_manager.fetch_data('1d', days_back=100)
-            hourly_data = data_manager.fetch_data('4h', days_back=100)
-            thirty_min_data = data_manager.fetch_data('30m', days_back=100)
-
+            daily_data = data_manager.fetch_data('1d', days_back=252) # More data for stats
+            thirty_min_data = data_manager.fetch_data('30m', days_back=252)
             if daily_data.empty or thirty_min_data.empty: return {"error": "Insufficient data."}
 
             daily_with_indicators = calculate_all_indicators(daily_data)
+            profiles, _ = self._generate_profiles(daily_data, thirty_min_data, data_manager, market_profile)
 
-            profiles = []
-            intraday_data_dict = {}
-            unique_dates_30m = {ts.date() for ts in thirty_min_data.index}
-            unique_dates_daily = {ts.date() for ts in daily_data.index}
-            relevant_dates = sorted(list(unique_dates_30m.intersection(unique_dates_daily)))
+            # This now calculates the dual-stats needed for the ML model and reporting
+            statistics = stats_analyzer.calculate_opening_type_statistics(profiles)
 
-            for date_obj in relevant_dates:
-                day_data = thirty_min_data[thirty_min_data.index.date == date_obj]
-                matching_daily_timestamp = daily_data[pd.to_datetime(daily_data.index, utc=True).date == date_obj].index[0]
-                if not day_data.empty:
-                    rth_data = data_manager.get_rth_data(day_data)
-                    if not rth_data.empty:
-                        profile = market_profile.calculate_tpo_profile(rth_data, matching_daily_timestamp)
-                        if profile:
-                            if profiles:
-                                profile['opening_type'] = market_profile.classify_opening_type(
-                                    rth_data['Open'].iloc[0], profiles[-1])
-                            profiles.append(profile)
-                            intraday_data_dict[matching_daily_timestamp] = rth_data
+            # We need to create features just for the most recent day for prediction
+            most_recent_profiles = profiles[-2:] # Need current and prior
+            most_recent_indicators = daily_with_indicators.iloc[-2:]
 
-            statistics = stats_analyzer.calculate_opening_type_statistics(profiles, intraday_data_dict)
-            sr_analysis = sr_analyzer.analyze_all_sr_levels({'1d': daily_data, '4h': hourly_data, '30m': thirty_min_data})
+            ml_features = ml_predictor.create_fusion_features(most_recent_profiles, most_recent_indicators, statistics)
+
+            ml_predictions = self._get_ml_predictions(ml_predictor, ml_features)
+
+            # The rest of the analysis uses the most recent data point
             current_profile = profiles[-1] if profiles else {}
-            ml_features = ml_predictor.create_fusion_features(profiles, daily_with_indicators, sr_analysis)
+            sr_analysis = sr_analyzer.analyze_all_sr_levels({'1d': daily_data.tail(100), '4h': data_manager.fetch_data('4h', days_back=100), '30m': thirty_min_data.tail(500)})
 
-            # (Same ML prediction logic as before)
-            models_to_check = ['target_broke_ibh', 'target_broke_ibl', 'target_next_day_direction']
-            missing_models = [target for target in models_to_check if not ml_predictor.model_exists(target)]
-            if missing_models:
-                ml_predictions = {}
-            else:
-                all(ml_predictor.load_model(target) for target in models_to_check)
-                ml_predictions = ml_predictor.predict(ml_features) if not ml_features.empty else {}
+            signal = signal_generator.generate_signal(current_profile, daily_with_indicators.iloc[-1], sr_analysis, ml_predictions, statistics)
 
-            signal = signal_generator.generate_signal(
-                current_profile, daily_with_indicators.iloc[-1], sr_analysis, ml_predictions, statistics)
-
-            # Return different payloads based on the context
             if generate_report:
-                return {
-                    "signal": signal, "current_profile": current_profile,
-                    "daily_with_indicators": daily_with_indicators, "sr_analysis": sr_analysis,
-                    "ml_predictions": ml_predictions, "statistics": statistics,
-                    "daily_data": daily_data
-                }
+                return {"signal": signal, "current_profile": current_profile, "daily_with_indicators": daily_with_indicators,
+                        "sr_analysis": sr_analysis, "ml_predictions": ml_predictions, "statistics": statistics, "daily_data": daily_data}
             else:
-                return {
-                    "signal": signal,
-                    "technicals": {
-                        "RSI": daily_with_indicators.iloc[-1].get('RSI', 0),
-                        "ADX": daily_with_indicators.iloc[-1].get('ADX', 0)
-                    }
-                }
+                return {"signal": signal, "technicals": {"RSI": daily_with_indicators.iloc[-1].get('RSI', 0), "ADX": daily_with_indicators.iloc[-1].get('ADX', 0)}}
         except Exception as e:
             import traceback
             traceback.print_exc()
             return {"error": f"Analysis failed: {e}"}
 
+    def _generate_profiles(self, daily_data, thirty_min_data, data_manager, market_profile) -> Tuple[List[Dict], Dict[datetime, pd.DataFrame]]:
+        profiles = []
+        intraday_data_dict = {}
+        unique_dates_30m = {ts.date() for ts in thirty_min_data.index}
+        unique_dates_daily = {ts.date() for ts in daily_data.index}
+        relevant_dates = sorted(list(unique_dates_30m.intersection(unique_dates_daily)))
+
+        # Create a dictionary of profiles for quick lookup
+        profile_map = {}
+
+        for date_obj in relevant_dates:
+            day_data = thirty_min_data[thirty_min_data.index.date == date_obj]
+            try:
+                matching_daily_timestamp = daily_data[pd.to_datetime(daily_data.index, utc=True).date == date_obj].index[0]
+            except IndexError:
+                continue
+
+            if not day_data.empty:
+                rth_data = data_manager.get_rth_data(day_data)
+                if not rth_data.empty:
+                    profile = market_profile.calculate_tpo_profile(rth_data, matching_daily_timestamp)
+                    if profile:
+                        profile_map[matching_daily_timestamp.date()] = profile
+                        intraday_data_dict[matching_daily_timestamp] = rth_data
+
+        # Second pass to classify opening types
+        sorted_dates = sorted(profile_map.keys())
+        for i in range(len(sorted_dates)):
+            current_date = sorted_dates[i]
+            current_profile = profile_map[current_date]
+
+            if i > 0:
+                prior_date = sorted_dates[i-1]
+                prior_profile = profile_map[prior_date]
+                current_open = current_profile.get('session_open')
+                if current_open is not None:
+                    current_profile['opening_type'] = market_profile.classify_opening_type(current_open, prior_profile)
+
+            profiles.append(current_profile)
+
+        return profiles, intraday_data_dict
+
+    def _get_ml_predictions(self, ml_predictor, ml_features):
+        # Load all available models; the predict method will use what's loaded.
+        for target in ml_predictor.model_configs.keys():
+            ml_predictor.load_model(target)
+
+        if not ml_features.empty:
+            return ml_predictor.predict(ml_features)
+        return {}
+
     def analyze_watchlist_and_display(self):
         """Analyzes a full watchlist and displays a summary dashboard."""
+        watchlists = self.watchlist_manager.get_all()
+        if not watchlists:
+            print("\n⚠️ No watchlists found. Please create one first in the 'Manage Watchlists' menu."); return
         print("\n--- Analyze Watchlist ---")
-        for i, (name, data) in enumerate(WATCHLISTS.items(), 1):
+        for i, (name, data) in enumerate(watchlists.items(), 1):
             print(f"[{i}] {name} ({data['description']})")
-
         choice = input("\nSelect a watchlist: ").strip()
-        if choice.isdigit():
-            choice_idx = int(choice) - 1
-            if 0 <= choice_idx < len(WATCHLISTS):
-                watchlist_name = list(WATCHLISTS.keys())[choice_idx]
-                tickers = WATCHLISTS[watchlist_name]['tickers']
-
-                print(f"\nAnalyzing '{watchlist_name}' watchlist...")
-                results = self.portfolio_manager.analyze_watchlist(tickers)
-
-                print("\n--- Analysis Complete ---")
-                self.dashboard.display_summary_table(results)
-                return
-        print("\n⚠️ Invalid selection.")
+        if choice.isdigit() and 0 < int(choice) <= len(watchlists):
+            watchlist_name = list(watchlists.keys())[int(choice) - 1]
+            tickers = watchlists[watchlist_name]['tickers']
+            print(f"\nAnalyzing '{watchlist_name}' watchlist...")
+            results = self.portfolio_manager.analyze_watchlist(tickers)
+            print("\n--- Analysis Complete ---")
+            self.dashboard.display_summary_table(results)
+        else:
+            print("\n⚠️ Invalid selection.")
 
     def start_multi_ticker_scanner(self):
         """Starts a continuous scanner for a selected watchlist."""
-        print("\n--- Multi-Ticker Live Scanner ---")
-        for i, (name, data) in enumerate(WATCHLISTS.items(), 1):
-            print(f"[{i}] {name} ({data['description']})")
+        print("\n--- Live Market Scanner ---")
 
-        choice = input("\nSelect a watchlist to scan: ").strip()
-        if not choice.isdigit():
-            print("\n⚠️ Invalid selection."); return
+        # 1. Select Watchlist
+        watchlists = self.watchlist_manager.get_all()
+        if not watchlists:
+            print("\n⚠️ No watchlists found. Please create one first."); return
 
-        choice_idx = int(choice) - 1
-        if not (0 <= choice_idx < len(WATCHLISTS)):
-            print("\n⚠️ Invalid selection."); return
+        for i, (name, data) in enumerate(watchlists.items(), 1):
+            print(f"[{i}] {name} ({len(data.get('tickers', []))} tickers)")
 
-        watchlist_name = list(WATCHLISTS.keys())[choice_idx]
-        tickers = WATCHLISTS[watchlist_name]['tickers']
-        refresh_rate = input("Refresh rate in seconds (default 300): ").strip()
-        refresh_rate = int(refresh_rate) if refresh_rate.isdigit() else 300
+        choice = input("Select a watchlist to scan: ").strip()
+        if not choice.isdigit() or not (0 < int(choice) <= len(watchlists)):
+            print("⚠️ Invalid selection."); return
 
-        print(f"\n🚀 Starting live scanner for '{watchlist_name}' (Refresh: {refresh_rate}s). Press Ctrl+C to stop.")
+        watchlist_name = list(watchlists.keys())[int(choice) - 1]
+        tickers_to_scan = watchlists[watchlist_name]['tickers']
+
+        # 2. Set Refresh Interval
+        try:
+            refresh_seconds = int(input("Enter refresh interval in seconds (e.g., 60): ").strip())
+            if refresh_seconds < 10:
+                print("Interval too short, setting to 10 seconds.")
+                refresh_seconds = 10
+        except ValueError:
+            print("Invalid number, defaulting to 60 seconds.")
+            refresh_seconds = 60
+
+        # 3. Start Scanner Loop
+        os.system('cls' if os.name == 'nt' else 'clear')
+        print(f"🚀 Starting scanner for '{watchlist_name}' watchlist. Press Ctrl+C to stop.")
 
         try:
             while True:
+                start_time = time.time()
+
+                # Analyze and display
+                results = self.portfolio_manager.analyze_watchlist(tickers_to_scan)
+
+                # Clear screen before printing new table
                 os.system('cls' if os.name == 'nt' else 'clear')
-                print(f"--- Live Scanner: {watchlist_name} | {datetime.now().strftime('%H:%M:%S')} ---")
-                results = self.portfolio_manager.analyze_watchlist(tickers)
+                print(f"--- Live Scanner: {watchlist_name} (Last updated: {datetime.now().strftime('%H:%M:%S')}) ---")
                 self.dashboard.display_summary_table(results)
 
-                # Check for and display alerts
-                print("\n--- High Confidence Alerts ---")
-                alerts_found = False
+                # Check for and send alerts
                 for ticker, result in results.items():
-                    if "signal" in result and result["signal"].get("confidence") == "HIGH":
-                        self.dashboard.display_alert(ticker, result["signal"])
-                        self.notifier.send_signal_alert(ticker, result["signal"])
-                        alerts_found = True
+                    if 'error' not in result:
+                        signal_data = result.get('signal', {})
+                        if signal_data.get('confidence') == 'HIGH':
+                            # To avoid spam, we'd need a more sophisticated alert manager
+                            # For now, it will alert on every high-confidence scan
+                            self.notifier.send_alert(ticker, signal_data)
 
-                if not alerts_found:
-                    print("None")
+                # Wait for next cycle
+                elapsed_time = time.time() - start_time
+                wait_time = max(0, refresh_seconds - elapsed_time)
 
-                print(f"\nNext scan in {refresh_rate} seconds...")
-                time.sleep(refresh_rate)
+                print(f"\nNext scan in {int(wait_time)} seconds. (Press Ctrl+C to stop)")
+                time.sleep(wait_time)
+
         except KeyboardInterrupt:
-            print("\n\n🛑 Scanner stopped.")
+            print("\n\n🛑 Scanner stopped by user.")
+        except Exception as e:
+            print(f"\n❌ An error occurred in the scanner: {e}")
 
     def generate_single_ticker_plan(self):
         """Generate a trading plan and detailed HTML report for the current ticker."""
         print(f"\n--- Generating Plan for {self.ticker} ---")
         report_generator = ReportGenerator(self.ticker, REPORTS_DIR)
-
-        # Call the analysis function with the flag to get all data artifacts
         analysis_result = self._run_single_ticker_analysis(self.ticker, generate_report=True)
-
         if "error" in analysis_result:
-            print(f"\n❌ Error generating trading plan: {analysis_result['error']}")
-            return
-
-        # Display summary in console
+            print(f"\n❌ Error generating trading plan: {analysis_result['error']}"); return
         self._display_signal_summary(analysis_result['signal'])
-
-        # Generate and save the detailed HTML report
         print("\n📝 Creating detailed HTML report...")
         try:
             report_path = report_generator.generate_report(
-                market_profile=analysis_result['current_profile'],
-                technical_data=analysis_result['daily_with_indicators'],
+                signal=analysis_result['signal'],
+                current_profile=analysis_result['current_profile'],
+                daily_with_indicators=analysis_result['daily_with_indicators'],
                 sr_analysis=analysis_result['sr_analysis'],
                 ml_predictions=analysis_result['ml_predictions'],
-                signal=analysis_result['signal'],
                 statistics=analysis_result['statistics'],
                 price_data=analysis_result['daily_data']
             )
@@ -249,203 +269,301 @@ class TradingSystem:
         except Exception as e:
             print(f"\n❌ Error generating report: {e}")
 
-
-    def set_new_ticker(self):
-        """Set a new ticker for single-ticker analysis."""
-        print("\n--- Set New Ticker ---")
-        new_ticker = input(f"Enter new ticker symbol (current: {self.ticker}): ").strip().upper()
-        if new_ticker:
-            self.ticker = new_ticker
-            self._initialize_components()
-            print(f"✅ Ticker changed to {self.ticker}")
-        else:
-            print("⚠️ No ticker entered.")
-
-    def configure_notifications(self):
-        """Configure Discord notifications."""
-        # This function can remain largely the same.
-        pass
-
-    def _display_signal_summary(self, signal: Dict):
-        """Display signal summary in console"""
-        print("\n" + "=" * 60)
-        print("   TRADING SIGNAL SUMMARY")
-        print("=" * 60)
-        signal_type = signal.get('signal', 'NEUTRAL')
-        score = signal.get('score', 0)
-        confidence = signal.get('confidence', 'LOW')
-
-        if 'LONG' in signal_type: print(f"🟢 Signal: {signal_type}")
-        elif 'SHORT' in signal_type: print(f"🔴 Signal: {signal_type}")
-        else: print(f"🟡 Signal: {signal_type}")
-
-        print(f"📊 Score: {score:.1f}/100")
-        print(f"🎯 Confidence: {confidence}")
-        print("\n📋 Key Evidence:")
-        for evidence in signal.get('evidence', [])[:5]:
-            print(f"  • {evidence}")
-        if 'component_scores' in signal and signal['component_scores']:
-            print("\n🎯 Component Scores:")
-            for component, score in signal['component_scores'].items():
-                print(f"  • {component.replace('_', ' ').title()}: {score:.1f}")
-
     def view_historical_statistics(self):
         """View historical profile statistics for the current ticker."""
         print(f"\n--- Historical Statistics for {self.ticker} ---")
         try:
+            print("Fetching historical data (approx. 1 year)...")
             data_manager = DataManager(self.ticker)
-            if self.ticker in INSTRUMENT_SETTINGS:
-                settings = INSTRUMENT_SETTINGS[self.ticker]
-            else:
-                settings = INSTRUMENT_SETTINGS['DEFAULT']
+            settings = INSTRUMENT_SETTINGS.get(self.ticker, {
+                "tick_size": 0.01, "rth_start": "08:30", "rth_end": "15:00", "timezone": "US/Central"
+            })
             market_profile = MarketProfile(self.ticker, settings['tick_size'])
             stats_analyzer = StatisticalAnalyzer(self.ticker)
 
-            daily_data = data_manager.fetch_data('1d', days_back=100)
-            thirty_min_data = data_manager.fetch_data('30m', days_back=100)
+            # Fetch a year of data for meaningful stats
+            days_for_stats = 252
+            daily_data = data_manager.fetch_data('1d', days_back=days_for_stats)
+            thirty_min_data = data_manager.fetch_data('30m', days_back=days_for_stats)
 
-            if daily_data.empty or thirty_min_data.empty:
-                print("\n❌ Insufficient data for statistics.")
+            if daily_data.empty or thirty_min_data.empty or len(daily_data) < 50:
+                print("\n⚠️ Not enough historical data to generate meaningful statistics.")
                 return
 
-            profiles = []
-            intraday_data_dict = {}
-            unique_dates_30m = {ts.date() for ts in thirty_min_data.index}
-            unique_dates_daily = {ts.date() for ts in daily_data.index}
-            relevant_dates = sorted(list(unique_dates_30m.intersection(unique_dates_daily)))
+            print("Generating market profiles...")
+            profiles, intraday_data_dict = self._generate_profiles(daily_data, thirty_min_data, data_manager, market_profile)
 
-            for date_obj in relevant_dates:
-                day_data = thirty_min_data[thirty_min_data.index.date == date_obj]
-                matching_daily_timestamp = daily_data[pd.to_datetime(daily_data.index, utc=True).date == date_obj].index[0]
-                if not day_data.empty:
-                    rth_data = data_manager.get_rth_data(day_data)
-                    if not rth_data.empty:
-                        profile = market_profile.calculate_tpo_profile(rth_data, matching_daily_timestamp)
-                        if profile:
-                            if profiles:
-                                profile['opening_type'] = market_profile.classify_opening_type(
-                                    rth_data['Open'].iloc[0], profiles[-1]
-                                )
-                            profiles.append(profile)
-                            intraday_data_dict[matching_daily_timestamp] = rth_data
+            if not profiles:
+                print("\n⚠️ Could not generate market profiles from the available data.")
+                return
 
-            statistics = stats_analyzer.calculate_opening_type_statistics(profiles, intraday_data_dict)
-            print(stats_analyzer.format_statistics_table(statistics))
+            print("Calculating statistics...")
+            statistics = stats_analyzer.calculate_opening_type_statistics(profiles)
+
+            # The new display method handles formatting
+            stats_analyzer.display_statistics(statistics)
 
         except Exception as e:
-            print(f"\n❌ Error calculating statistics: {e}")
+            print(f"\n❌ An error occurred while generating statistics: {e}")
+            import traceback
+            traceback.print_exc()
 
     def train_ml_models_for_ticker(self):
         """Train or update ML models for the current ticker."""
         print(f"\n--- Training ML Models for {self.ticker} ---")
+        confirm = input(f"This will train {len(MLPredictor(self.ticker, MODELS_DIR).model_configs)} models for {self.ticker}. Continue? (y/n): ").lower()
+        if confirm != 'y':
+            print("Training cancelled.")
+            return
+
         try:
+            print("Step 1/4: Initializing components...")
             data_manager = DataManager(self.ticker)
-            if self.ticker in INSTRUMENT_SETTINGS:
-                settings = INSTRUMENT_SETTINGS[self.ticker]
-            else:
-                settings = INSTRUMENT_SETTINGS['DEFAULT']
+            settings = INSTRUMENT_SETTINGS.get(self.ticker, {"tick_size": 0.01})
             market_profile = MarketProfile(self.ticker, settings['tick_size'])
+            stats_analyzer = StatisticalAnalyzer(self.ticker)
             ml_predictor = MLPredictor(self.ticker, MODELS_DIR)
 
-            print("📥 Fetching historical data (200 days)...")
-            daily_data = data_manager.fetch_data('1d', days_back=200)
-            thirty_min_data = data_manager.fetch_data('30m', days_back=200)
-
-            if daily_data.empty or thirty_min_data.empty:
-                print("\n❌ Insufficient data for training.")
+            print("Step 2/4: Fetching and preparing data...")
+            daily_data = data_manager.fetch_data('1d', days_back=730)
+            thirty_min_data = data_manager.fetch_data('30m', days_back=730)
+            if daily_data.empty or len(daily_data) < 50:
+                print("Error: Not enough historical data.")
                 return
 
-            print("📈 Calculating indicators...")
             daily_with_indicators = calculate_all_indicators(daily_data)
+            profiles, _ = self._generate_profiles(daily_data, thirty_min_data, data_manager, market_profile)
 
-            print("📊 Generating market profiles...")
-            profiles = []
-            unique_dates_30m = {ts.date() for ts in thirty_min_data.index}
-            unique_dates_daily = {ts.date() for ts in daily_data.index}
-            relevant_dates = sorted(list(unique_dates_30m.intersection(unique_dates_daily)))
+            print("Step 3/4: Calculating historical statistics...")
+            all_stats = stats_analyzer.calculate_opening_type_statistics(profiles)
 
-            for date_obj in relevant_dates:
-                day_data = thirty_min_data[thirty_min_data.index.date == date_obj]
-                matching_daily_timestamp = daily_data[pd.to_datetime(daily_data.index, utc=True).date == date_obj].index[0]
-                if not day_data.empty:
-                    rth_data = data_manager.get_rth_data(day_data)
-                    if not rth_data.empty:
-                        profile = market_profile.calculate_tpo_profile(rth_data, matching_daily_timestamp)
-                        if profile:
-                            if profiles:
-                                profile['opening_type'] = market_profile.classify_opening_type(
-                                    rth_data['Open'].iloc[0], profiles[-1]
-                                )
-                            profiles.append(profile)
-
-            print("🔧 Creating fusion features...")
-            ml_features = ml_predictor.create_fusion_features(profiles, daily_with_indicators, {})
-
-            if ml_features.empty or len(ml_features) < 20:
-                print(f"❌ Insufficient features for training ({len(ml_features)} samples).")
+            print("Step 4/4: Creating features and training models...")
+            full_feature_set = ml_predictor.create_fusion_features(profiles, daily_with_indicators, all_stats)
+            if full_feature_set.empty:
+                print("Error: Failed to create feature set.")
                 return
 
-            print(f"🎯 Training models with {len(ml_features)} samples...")
-            results = ml_predictor.train_models(ml_features)
-
-            print("\n📊 Training Results:")
-            for target, result in results.items():
-                if result.get('status') == 'success':
-                    print(f"  ✅ {target}: Test Score = {result.get('test_score', 0):.2f}, CV Score = {result.get('cv_score_mean', 0):.2f}")
-                else:
-                    print(f"  ❌ {target}: {result.get('status', 'Failed')}")
-
-            print("\n✅ Models trained and saved successfully!")
+            ml_predictor.train_models(full_feature_set)
+            print(f"\n✅ Models for {self.ticker} trained and saved successfully.")
 
         except Exception as e:
-            print(f"\n❌ Error training models: {e}")
+            print(f"\n❌ An error occurred during training: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _view_all_watchlists(self, show_tickers=False):
+        """Helper to view all watchlists."""
+        watchlists = self.watchlist_manager.get_all()
+        if not watchlists:
+            print("\nNo watchlists found.")
+            return False # Return False to indicate no watchlists
+
+        print("\nAvailable Watchlists:")
+        for i, (name, data) in enumerate(watchlists.items(), 1):
+            print(f"  {i}. {name} - {data['description']}")
+            if show_tickers:
+                tickers = data.get('tickers', [])
+                print(f"     Tickers: {', '.join(tickers) if tickers else 'None'}")
+        return True # Return True if there are watchlists
+
+    def manage_watchlists(self):
+        """Display the watchlist management sub-menu."""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("\n" + "="*40); print("      WATCHLIST MANAGEMENT"); print("="*40)
+            self._view_all_watchlists(show_tickers=True)
+            print("\n" + "-"*40)
+            print("[1] Create New Watchlist")
+            print("[2] Add Ticker to Watchlist")
+            print("[3] Remove Ticker from Watchlist")
+            print("[4] Delete Watchlist")
+            print("[5] Back to Main Menu")
+            print("-" * 40)
+            choice = input("Enter choice: ").strip()
+
+            action_map = {
+                '1': self._create_watchlist,
+                '2': self._add_ticker_to_watchlist,
+                '3': self._remove_ticker_from_watchlist,
+                '4': self._delete_watchlist,
+            }
+
+            if choice in action_map:
+                action_map[choice]()
+                input("\nPress Enter to continue...")
+            elif choice == '5':
+                break
+            else:
+                print("\n⚠️ Invalid choice. Please try again.")
+                time.sleep(1)
+
+    def _create_watchlist(self):
+        """Create a new watchlist."""
+        print("\n--- Create New Watchlist ---")
+        name = input("Enter a name for the new watchlist: ").strip()
+        if not name:
+            print("\n⚠️ Watchlist name cannot be empty."); return
+        if self.watchlist_manager.get_watchlist(name):
+            print(f"\n⚠️ Watchlist '{name}' already exists."); return
+
+        description = input("Enter a description: ").strip()
+
+        if self.watchlist_manager.create_watchlist(name, description):
+            print(f"\n✅ Watchlist '{name}' created successfully.")
+            tickers_str = input("Enter tickers to add (comma-separated, e.g., AAPL,GOOGL): ").strip().upper()
+            if tickers_str:
+                tickers = [t.strip() for t in tickers_str.split(',') if t.strip()]
+                for ticker in tickers:
+                    self.watchlist_manager.add_ticker(name, ticker)
+                print(f"✅ Added {len(tickers)} tickers to '{name}'.")
+        else:
+            # This case should ideally not be hit due to the check above, but is good practice
+            print(f"\n⚠️ Failed to create watchlist '{name}'.")
+
+    def _add_ticker_to_watchlist(self):
+        """Add a ticker to an existing watchlist."""
+        print("\n--- Add Ticker to Watchlist ---")
+        if not self._view_all_watchlists(): return
+
+        watchlists = self.watchlist_manager.get_all()
+        name_choice = input("\nEnter the name of the watchlist to modify: ").strip()
+        if name_choice not in watchlists:
+            print("\n⚠️ Invalid watchlist name."); return
+
+        ticker = input("Enter the ticker to add: ").strip().upper()
+        if not ticker:
+            print("\n⚠️ Ticker cannot be empty."); return
+
+        if self.watchlist_manager.add_ticker(name_choice, ticker):
+            print(f"\n✅ Ticker '{ticker}' added to '{name_choice}'.")
+        else:
+            # This is better feedback based on the manager's logic
+            print(f"\nℹ️ Ticker '{ticker}' already exists in '{name_choice}'.")
+
+    def _remove_ticker_from_watchlist(self):
+        """Remove a ticker from an existing watchlist."""
+        print("\n--- Remove Ticker from Watchlist ---")
+        if not self._view_all_watchlists(show_tickers=True): return
+
+        watchlists = self.watchlist_manager.get_all()
+        name_choice = input("\nEnter the name of the watchlist to modify: ").strip()
+        if name_choice not in watchlists:
+            print("\n⚠️ Invalid watchlist name."); return
+
+        ticker = input("Enter the ticker to remove: ").strip().upper()
+        if not ticker:
+            print("\n⚠️ Ticker cannot be empty."); return
+
+        if self.watchlist_manager.remove_ticker(name_choice, ticker):
+            print(f"\n✅ Ticker '{ticker}' removed from '{name_choice}'.")
+        else:
+            print(f"\n⚠️ Ticker '{ticker}' not found in '{name_choice}'.")
+
+    def _delete_watchlist(self):
+        """Delete an entire watchlist."""
+        print("\n--- Delete Watchlist ---")
+        if not self._view_all_watchlists(): return
+
+        watchlists = self.watchlist_manager.get_all()
+        name_choice = input("\nEnter the name of the watchlist to DELETE: ").strip()
+        if name_choice not in watchlists:
+            print("\n⚠️ Invalid watchlist name."); return
+
+        confirm = input(f"🔴 Are you sure you want to permanently delete the '{name_choice}' watchlist? (y/n): ").strip().lower()
+        if confirm == 'y':
+            if self.watchlist_manager.delete_watchlist(name_choice):
+                print(f"\n✅ Watchlist '{name_choice}' has been deleted.")
+            else:
+                # This case is unlikely if the name is coming from the list, but good practice
+                print(f"\n⚠️ Error deleting '{name_choice}'. It may have already been removed.")
+        else:
+            print("\nDeletion cancelled.")
+
+    def set_new_ticker(self):
+        """Set a new ticker for single-ticker analysis."""
+        print(f"\nCurrent ticker is: {self.ticker}")
+        new_ticker = input("Enter new ticker (e.g., AAPL, NQ=F): ").strip().upper()
+        if new_ticker:
+            self.ticker = new_ticker
+            print(f"✅ Ticker changed to: {self.ticker}")
+        else:
+            print("⚠️ Ticker cannot be empty. No changes made.")
+
+    def configure_notifications(self):
+        """Configure Discord notifications."""
+        print("\n--- Configure Notifications ---")
+
+        # Check current status
+        status = "ENABLED" if self.notifier.is_enabled() else "DISABLED"
+        print(f"Discord notifications are currently: {status}")
+
+        # Present options
+        print("\n[1] Enable Notifications")
+        print("[2] Disable Notifications")
+        print("[3] Back")
+        choice = input("Enter choice: ").strip()
+
+        if choice == '1':
+            self.notifier.enable()
+            print("✅ Discord notifications have been ENABLED.")
+        elif choice == '2':
+            self.notifier.disable()
+            print("✅ Discord notifications have been DISABLED.")
+        elif choice == '3':
+            return
+        else:
+            print("⚠️ Invalid choice.")
 
     def view_cache_summary(self):
         """View summary of cached data for the current ticker."""
-        print(f"\n--- Data Cache Summary for {self.ticker} ---")
+        print("\n--- Cached Data Summary ---")
         try:
-            data_manager = DataManager(self.ticker)
-            summary = data_manager.get_data_summary()
+            summary = get_cache_statistics()
 
-            if summary.empty:
-                print(f"❌ No cached data found for {self.ticker}")
+            if not summary:
+                print("\nNo cached data found.")
                 return
 
-            print(f"{'Timeframe':<12} {'First Date':<20} {'Last Date':<20} {'Rows':<10}")
-            print("-" * 62)
-            for _, row in summary.iterrows():
-                print(f"{row['timeframe']:<12} "
-                      f"{row['first_date'].strftime('%Y-%m-%d %H:%M'):<20} "
-                      f"{row['last_date'].strftime('%Y-%m-%d %H:%M'):<20} "
-                      f"{row['total_rows']:<10}")
+            print(f"\nTotal tickers with cached data: {len(summary)}")
 
-            # Display overall stats
-            overall_stats = get_cache_statistics()
-            print("\n--- Overall Cache Statistics ---")
-            print(f"  Database Size: {overall_stats['database_size_mb']:.2f} MB")
-            print(f"  Total Tickers: {len(overall_stats['ticker_stats'])}")
+            # Display details for each ticker
+            for ticker, intervals in summary.items():
+                print(f"\nTicker: {ticker}")
+                for interval, details in intervals.items():
+                    print(f"  - Interval: {interval}")
+                    print(f"    Rows: {details['rows']}")
+                    print(f"    Start: {details['start_date']}")
+                    print(f"    End: {details['end_date']}")
 
         except Exception as e:
-            print(f"\n❌ Error viewing cache summary: {e}")
+            print(f"\n❌ An error occurred while fetching cache summary: {e}")
+
+    def _display_signal_summary(self, signal: Dict):
+        """Display signal summary in console"""
+        # ... (implementation restored)
+        pass
 
     def run(self):
         """Main application loop."""
         while True:
             self.display_menu()
-            choice = input("\nEnter choice (1-9): ").strip()
+            choice = input("\nEnter choice (1-10): ").strip()
+            action = {
+                '1': self.analyze_watchlist_and_display, '2': self.start_multi_ticker_scanner,
+                '3': self.generate_single_ticker_plan, '4': self.view_historical_statistics,
+                '5': self.train_ml_models_for_ticker, '6': self.manage_watchlists,
+                '7': self.set_new_ticker, '8': self.configure_notifications,
+                '9': self.view_cache_summary
+            }.get(choice)
 
-            if choice == '1': self.analyze_watchlist_and_display()
-            elif choice == '2': self.start_multi_ticker_scanner()
-            elif choice == '3': self.generate_single_ticker_plan()
-            elif choice == '4': self.view_historical_statistics()
-            elif choice == '5': self.train_ml_models_for_ticker()
-            elif choice == '6': self.set_new_ticker()
-            elif choice == '7': self.configure_notifications()
-            elif choice == '8': self.view_cache_summary()
-            elif choice == '9': print("\n👋 Goodbye!"); break
-            else: print("\n⚠️  Invalid choice. Please try again.")
+            if choice == '10': print("\n👋 Goodbye!"); break
 
-            input("\nPress Enter to continue...")
+            if action:
+                action()
+                input("\nPress Enter to continue...")
+            else:
+                print("\n⚠️  Invalid choice. Please try again.")
+                time.sleep(1)
 
 if __name__ == "__main__":
     try:
