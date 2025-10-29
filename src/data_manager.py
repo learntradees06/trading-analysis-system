@@ -4,6 +4,7 @@ import sqlite3
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
+import pytz
 import threading
 from typing import Optional, Dict, Any, List
 from pathlib import Path
@@ -115,8 +116,8 @@ class DataManager:
         cols_to_keep = [col for col in db_columns if col in df_to_cache.columns]
         df_to_cache = df_to_cache[cols_to_keep]
         df_to_cache.reset_index(inplace=True)
-        # Handle both 'index' and 'Datetime' for timestamp column
-        df_to_cache = df_to_cache.rename(columns={'index': 'timestamp', 'Datetime': 'timestamp'})
+        # Handle all possible timestamp column names from yfinance and reset_index
+        df_to_cache = df_to_cache.rename(columns={'index': 'timestamp', 'Date': 'timestamp', 'Datetime': 'timestamp'})
         df_to_cache['ticker'] = self.ticker
         df_to_cache['timeframe'] = timeframe
 
