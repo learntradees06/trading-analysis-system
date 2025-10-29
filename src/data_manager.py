@@ -30,14 +30,10 @@ class Database:
     def get_connection(self): return self.conn
 
 class DataManager:
-    YF_INTERVAL_MAP = {'1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1h': '1h', '4h': '1h', '1d': '1d', '1wk': '1wk'}
-    # Corrected YF_INTERVAL_MAP
-    YF_INTERVAL_MAP = {'1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1h': '1h', '4h': '4h', '1d': '1d', '1wk': '1wk'}
+    YF_INTERVAL_MAP = {'1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1h': '1h', '1d': '1d', '1wk': '1wk'}
     YF_MAX_DAYS = {
         '1m': 7, '5m': 60, '15m': 60, '30m': 60, '1h': 730,
-        '4h': 730, # Assumption for 4h, yfinance does not directly support it
-        '1d': 10000, # Essentially unlimited
-        '1wk': 10000 # Essentially unlimited
+        '1d': 10000, '1wk': 10000
     }
 
     def __init__(self, ticker: str):
@@ -64,37 +60,44 @@ class DataManager:
 
     def fetch_data(self, timeframe: str, days_back: int = 365) -> pd.DataFrame:
         df = self._get_cached_data(timeframe)
+
+        # Define slicing logic based on timeframe
+        if timeframe in ['1d', '1wk']:
+            slicer = lambda d: d.tail(days_back)
+        else:
+            # Convert trading days to calendar days for a rough estimate
+            calendar_days = int(days_back * 365.25 / 252) + 5 # Add a small buffer
+            cutoff_date = datetime.now(pytz.UTC) - timedelta(days=calendar_days)
+            slicer = lambda d: d[d.index >= cutoff_date]
+
         if not df.empty and (datetime.now(pytz.UTC) - df.index.max()) < timedelta(minutes=15):
              logger.info(f"Using fresh cached data for {self.ticker} {timeframe}")
-             return df.tail(days_back)
+             return slicer(df)
 
         logger.info(f"Fetching new data for {self.ticker} {timeframe}")
-        yf_interval = self.YF_INTERVAL_MAP.get(timeframe, '1d')
+        yf_interval = self.YF_INTERVAL_MAP.get(timeframe)
+        if not yf_interval:
+            logger.error(f"Invalid timeframe requested: {timeframe}")
+            return pd.DataFrame()
 
-        # Respect yfinance API limits
         max_days = self.YF_MAX_DAYS.get(yf_interval, 365)
-        period_to_fetch = min(days_back + 100, max_days) # Add buffer for indicators, but cap at max_days
+        period_to_fetch = min(days_back + 100, max_days)
 
         new_data = self.yf_ticker.history(period=f"{period_to_fetch}d", interval=yf_interval, auto_adjust=False)
 
         if new_data.empty:
             logger.warning(f"No data returned from yfinance for {self.ticker} {timeframe}")
-            return df # Return stale cache if available
+            return slicer(df) if not df.empty else pd.DataFrame()
 
         new_data.columns = [col.capitalize() for col in new_data.columns]
         if 'Adj close' in new_data.columns:
             new_data = new_data.rename(columns={'Adj close': 'Adj_close'})
 
-        if timeframe == '4h': # Aggregate 1h to 4h
-            new_data = new_data.resample('4H').agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-            }).dropna()
-
         if new_data.index.tz is None: new_data.index = new_data.index.tz_localize('UTC')
         else: new_data.index = new_data.index.tz_convert('UTC')
 
         self._cache_data(new_data, timeframe)
-        return new_data.tail(days_back)
+        return slicer(new_data)
 
     def _get_cached_data(self, timeframe: str) -> pd.DataFrame:
         query = "SELECT timestamp, open, high, low, close, volume FROM ohlcv_data WHERE ticker = ? AND timeframe = ? ORDER BY timestamp"
@@ -116,8 +119,9 @@ class DataManager:
         cols_to_keep = [col for col in db_columns if col in df_to_cache.columns]
         df_to_cache = df_to_cache[cols_to_keep]
         df_to_cache.reset_index(inplace=True)
-        # Handle all possible timestamp column names from yfinance and reset_index
-        df_to_cache = df_to_cache.rename(columns={'index': 'timestamp', 'Date': 'timestamp', 'Datetime': 'timestamp'})
+        # The index column from yfinance can have various names ('Date', 'Datetime', or 'index').
+        # After reset_index(), this column is always at position 0. We robustly rename it to 'timestamp'.
+        df_to_cache.rename(columns={df_to_cache.columns[0]: 'timestamp'}, inplace=True)
         df_to_cache['ticker'] = self.ticker
         df_to_cache['timeframe'] = timeframe
 

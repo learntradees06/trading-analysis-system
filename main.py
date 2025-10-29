@@ -62,13 +62,7 @@ class TradingSystem:
     def _run_single_ticker_analysis(self, ticker: str, generate_report: bool = False) -> Dict:
         """The core analysis logic for a single ticker."""
         data_manager = DataManager(ticker)
-        # Provide a sensible default if the ticker is not in the config
-        default_settings = {
-            "tick_size": 0.01,
-            "rth_start": "08:30",
-            "rth_end": "15:00",
-            "timezone": "US/Central"
-        }
+        default_settings = {"tick_size": 0.01, "rth_start": "08:30", "rth_end": "15:00", "timezone": "US/Central"}
         settings = INSTRUMENT_SETTINGS.get(ticker, default_settings)
         market_profile = MarketProfile(ticker, settings['tick_size'])
         sr_analyzer = SRLevelAnalyzer(ticker, settings['tick_size'])
@@ -76,33 +70,27 @@ class TradingSystem:
         ml_predictor = MLPredictor(ticker, MODELS_DIR)
         signal_generator = SignalGenerator(ticker)
         try:
-            daily_data = data_manager.fetch_data('1d', days_back=252) # More data for stats
-            thirty_min_data = data_manager.fetch_data('30m', days_back=252)
-            if daily_data.empty or thirty_min_data.empty: return {"error": "Insufficient data."}
+            timeframes = ['1wk', '1d', '1h', '30m', '15m', '5m']
+            data = {tf: data_manager.fetch_data(tf, days_back=252) for tf in timeframes}
+            if data['1d'].empty or data['30m'].empty: return {"error": "Insufficient base data."}
 
-            daily_with_indicators = calculate_all_indicators(daily_data)
-            profiles, _ = self._generate_profiles(daily_data, thirty_min_data, data_manager, market_profile)
-
-            # This now calculates the dual-stats needed for the ML model and reporting
+            daily_with_indicators = calculate_all_indicators(data['1d'])
+            profiles, _ = self._generate_profiles(data['1d'], data['30m'], data_manager, market_profile)
             statistics = stats_analyzer.calculate_opening_type_statistics(profiles)
 
-            # We need to create features just for the most recent day for prediction
-            most_recent_profiles = profiles[-2:] # Need current and prior
-            most_recent_indicators = daily_with_indicators.iloc[-2:]
+            # Create features for the most recent day for opening type prediction
+            prediction_features = ml_predictor.create_prediction_features(profiles, daily_with_indicators, statistics)
+            ml_predictions = self._get_ml_predictions(ml_predictor, prediction_features)
 
-            ml_features = ml_predictor.create_fusion_features(most_recent_profiles, most_recent_indicators, statistics)
-
-            ml_predictions = self._get_ml_predictions(ml_predictor, ml_features)
-
-            # The rest of the analysis uses the most recent data point
             current_profile = profiles[-1] if profiles else {}
-            sr_analysis = sr_analyzer.analyze_all_sr_levels({'1d': daily_data.tail(100), '4h': data_manager.fetch_data('4h', days_back=100), '30m': thirty_min_data.tail(500)})
+            sr_analysis = sr_analyzer.analyze_all_sr_levels(data)
 
+            # Note: Signal generator might need adjustment to handle new prediction format
             signal = signal_generator.generate_signal(current_profile, daily_with_indicators.iloc[-1], sr_analysis, ml_predictions, statistics)
 
             if generate_report:
                 return {"signal": signal, "current_profile": current_profile, "daily_with_indicators": daily_with_indicators,
-                        "sr_analysis": sr_analysis, "ml_predictions": ml_predictions, "statistics": statistics, "daily_data": daily_data}
+                        "sr_analysis": sr_analysis, "ml_predictions": ml_predictions, "statistics": statistics, "all_data": data}
             else:
                 return {"signal": signal, "technicals": {"RSI": daily_with_indicators.iloc[-1].get('RSI', 0), "ADX": daily_with_indicators.iloc[-1].get('ADX', 0)}}
         except Exception as e:
@@ -152,14 +140,12 @@ class TradingSystem:
 
         return profiles, intraday_data_dict
 
-    def _get_ml_predictions(self, ml_predictor, ml_features):
-        # Load all available models; the predict method will use what's loaded.
-        for target in ml_predictor.model_configs.keys():
-            ml_predictor.load_model(target)
-
-        if not ml_features.empty:
-            return ml_predictor.predict(ml_features)
-        return {}
+    def _get_ml_predictions(self, ml_predictor, prediction_features):
+        """Loads the opening type model and returns predictions."""
+        if ml_predictor.load_model():
+            if not prediction_features.empty:
+                return ml_predictor.predict(prediction_features)
+        return {"error": "ML model not found or failed to load. Please train the model."}
 
     def analyze_watchlist_and_display(self):
         """Analyzes a full watchlist and displays a summary dashboard."""
@@ -263,7 +249,7 @@ class TradingSystem:
                 sr_analysis=analysis_result['sr_analysis'],
                 ml_predictions=analysis_result['ml_predictions'],
                 statistics=analysis_result['statistics'],
-                price_data=analysis_result['daily_data']
+                all_data=analysis_result['all_data']
             )
             print(f"✅ Report saved to: {report_path}")
         except Exception as e:
@@ -309,42 +295,38 @@ class TradingSystem:
             traceback.print_exc()
 
     def train_ml_models_for_ticker(self):
-        """Train or update ML models for the current ticker."""
-        print(f"\n--- Training ML Models for {self.ticker} ---")
-        confirm = input(f"This will train {len(MLPredictor(self.ticker, MODELS_DIR).model_configs)} models for {self.ticker}. Continue? (y/n): ").lower()
+        """Train the new multiclass opening type prediction model."""
+        print(f"\n--- Training Opening Type Prediction Model for {self.ticker} ---")
+        confirm = input(f"This will train a new opening type prediction model for {self.ticker}. This requires significant historical data (at least 2 years recommended). Continue? (y/n): ").lower()
         if confirm != 'y':
-            print("Training cancelled.")
-            return
+            print("Training cancelled."); return
 
         try:
-            print("Step 1/4: Initializing components...")
+            print("Step 1/3: Initializing components and fetching data...")
             data_manager = DataManager(self.ticker)
-            settings = INSTRUMENT_SETTINGS.get(self.ticker, {"tick_size": 0.01})
+            settings = INSTRUMENT_SETTINGS.get(self.ticker, {"tick_size": 0.01, "rth_start": "08:30", "rth_end": "15:00", "timezone": "US/Central"})
             market_profile = MarketProfile(self.ticker, settings['tick_size'])
-            stats_analyzer = StatisticalAnalyzer(self.ticker)
             ml_predictor = MLPredictor(self.ticker, MODELS_DIR)
 
-            print("Step 2/4: Fetching and preparing data...")
+            # Fetch ample data for feature creation
             daily_data = data_manager.fetch_data('1d', days_back=730)
             thirty_min_data = data_manager.fetch_data('30m', days_back=730)
-            if daily_data.empty or len(daily_data) < 50:
-                print("Error: Not enough historical data.")
-                return
+            if daily_data.empty or len(daily_data) < 100: # Need at least 100 days for a decent training set
+                print("Error: Not enough historical data (<100 days) to train the model."); return
 
+            print("Step 2/3: Generating profiles, indicators, and statistics...")
             daily_with_indicators = calculate_all_indicators(daily_data)
             profiles, _ = self._generate_profiles(daily_data, thirty_min_data, data_manager, market_profile)
+            statistics = stats_analyzer.calculate_opening_type_statistics(profiles)
 
-            print("Step 3/4: Calculating historical statistics...")
-            all_stats = stats_analyzer.calculate_opening_type_statistics(profiles)
+            print("Step 3/3: Creating feature set and training model...")
+            full_feature_set = ml_predictor.create_features(profiles, daily_with_indicators, statistics)
 
-            print("Step 4/4: Creating features and training models...")
-            full_feature_set = ml_predictor.create_fusion_features(profiles, daily_with_indicators, all_stats)
-            if full_feature_set.empty:
-                print("Error: Failed to create feature set.")
-                return
+            if full_feature_set.empty or len(full_feature_set) < 50:
+                print("Error: Failed to create a sufficiently large feature set (<50 samples). More data may be required."); return
 
-            ml_predictor.train_models(full_feature_set)
-            print(f"\n✅ Models for {self.ticker} trained and saved successfully.")
+            ml_predictor.train_model(full_feature_set)
+            print(f"\n✅ Model for {self.ticker} trained and saved successfully.")
 
         except Exception as e:
             print(f"\n❌ An error occurred during training: {e}")

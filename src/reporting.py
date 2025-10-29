@@ -18,7 +18,14 @@ class ReportGenerator:
         self.html_template = self._get_html_template()
 
     def generate_report(self, signal: Dict, current_profile: Dict, daily_with_indicators: pd.DataFrame,
-                        sr_analysis: Dict, ml_predictions: Dict, statistics: Dict, price_data: pd.DataFrame) -> str:
+                        sr_analysis: Dict, ml_predictions: Dict, statistics: Dict, all_data: Dict) -> str:
+
+        # We need the SRLevelAnalyzer to recalculate fib_levels for the report
+        from src.sr_levels import SRLevelAnalyzer
+        from src.config import INSTRUMENT_SETTINGS
+        settings = INSTRUMENT_SETTINGS.get(self.ticker, {"tick_size": 0.01})
+        sr_analyzer = SRLevelAnalyzer(self.ticker, settings['tick_size'])
+        fib_levels = sr_analyzer.calculate_fibonacci_levels(all_data['1d'])
 
         template_vars = {
             'ticker': self.ticker,
@@ -28,8 +35,11 @@ class ReportGenerator:
             'signal_section': self._generate_signal_section(signal),
             'key_levels': self._generate_key_levels_section(current_profile, sr_analysis),
             'statistics_tables': self._generate_statistics_tables(statistics, current_profile.get('opening_type')),
-            'ml_predictions': self._generate_ml_predictions_section(ml_predictions),
-            'chart_script': self._generate_price_chart(price_data, daily_with_indicators, current_profile, sr_analysis),
+            'ml_predictions_section': self._generate_ml_predictions_section(ml_predictions, statistics),
+            'chart_script': self._generate_price_chart(all_data['1d'], daily_with_indicators, current_profile, sr_analysis),
+            'atr_table': self._generate_atr_table(daily_with_indicators),
+            'fibonacci_table': self._generate_fibonacci_table(fib_levels),
+            'sr_cluster_table': self._generate_sr_cluster_table(sr_analysis),
         }
 
         html_content = Template(self.html_template).render(template_vars)
@@ -72,10 +82,73 @@ class ReportGenerator:
         table += "</table>"
         return table
 
-    def _generate_ml_predictions_section(self, predictions: Dict) -> str:
-        if not predictions: return "<p>No ML predictions available.</p>"
-        pred_html = "".join([f"<li><strong>{target.replace('target_', '')}:</strong> {'Yes' if p['prediction'] == 1 else 'No'} ({p['confidence']:.1%})</li>" for target, p in predictions.items()])
-        return f"<ul>{pred_html}</ul>"
+    def _generate_ml_predictions_section(self, predictions: Dict, statistics: Dict) -> str:
+        if not predictions or 'error' in predictions:
+            return f"<p>ML Predictions not available: {predictions.get('error', 'N/A')}</p>"
+
+        pred = predictions.get('predicted_opening_type', 'N/A')
+        conf = predictions.get('confidence', 0)
+
+        html = f"<p><strong>Predicted Next Open Type:</strong> {pred} (Confidence: {conf:.1%})</p>"
+
+        # Now, add the statistics tables for the predicted opening type
+        if pred != 'N/A' and statistics:
+            html += f"<p><strong>Historical Probabilities for Predicted '{pred}' Opening:</strong></p>"
+            html += self._format_stat_table("Close Above Probability", statistics, 'close_above', pred)
+            html += self._format_stat_table("Broken During RTH Probability", statistics, 'broken_during_rth', pred)
+
+        return html
+
+    def _generate_atr_table(self, daily_data: pd.DataFrame) -> str:
+        """Generates an HTML table for ATR and ATR Projections."""
+        if 'ATR' not in daily_data.columns: return ""
+        current_atr = daily_data['ATR'].iloc[-1]
+        current_close = daily_data['Close'].iloc[-1]
+
+        table = "<h4>ATR Analysis</h4><table>"
+        table += f"<tr><td>Current ATR (14D)</td><td>{current_atr:.2f}</td></tr>"
+        table += f"<tr><td>ATR % of Price</td><td>{ (current_atr / current_close) * 100:.2f}%</td></tr>"
+        table += "<tr><td colspan='2' style='text-align:center;'><strong>ATR Projections</strong></td></tr>"
+        table += f"<tr><td>+1 ATR</td><td>{current_close + current_atr:.2f}</td></tr>"
+        table += f"<tr><td>-1 ATR</td><td>{current_close - current_atr:.2f}</td></tr>"
+        table += f"<tr><td>+2 ATR</td><td>{current_close + (current_atr * 2):.2f}</td></tr>"
+        table += f"<tr><td>-2 ATR</td><td>{current_close - (current_atr * 2):.2f}</td></tr>"
+        table += "</table>"
+        return table
+
+    def _generate_fibonacci_table(self, fib_levels: Dict) -> str:
+        """Generates an HTML table for Fibonacci levels."""
+        if not fib_levels: return ""
+        table = "<h4>Fibonacci Levels</h4><table><tr><th>Level</th><th>Price</th></tr>"
+        for name, level in fib_levels.items():
+            # Clean up the name for display
+            display_name = name.replace('fib_ext_', 'Extension ').replace('fib_', 'Retracement ').replace('_', '.')
+            table += f"<tr><td>{display_name.title()}</td><td>{level:.2f}</td></tr>"
+        table += "</table>"
+        return table
+
+    def _generate_sr_cluster_table(self, sr_analysis: Dict) -> str:
+        """Generates an HTML table for S/R Cluster Zones."""
+        if not sr_analysis or 'all_zones' not in sr_analysis: return ""
+
+        zones = sr_analysis['all_zones']
+        # Sort by strength (confluence score)
+        sorted_zones = sorted(zones, key=lambda z: z.get('confluence_score', 0), reverse=True)
+
+        table = "<h4>S/R Cluster Zones (by Strength)</h4><table>"
+        table += "<tr><th>Price Range</th><th>Center</th><th>Type</th><th>Strength</th><th>Confluent Reasons</th></tr>"
+
+        for zone in sorted_zones[:10]: # Display top 10 strongest zones
+            price_range = f"{zone.get('zone_low', 0):.2f} - {zone.get('zone_high', 0):.2f}"
+            center = f"{zone.get('zone_center', 0):.2f}"
+            zone_type = zone.get('type', 'N/A')
+            strength = zone.get('confluence_score', 0)
+            reasons = ", ".join(zone.get('confluent_reasons', []))
+
+            table += f"<tr><td>{price_range}</td><td>{center}</td><td>{zone_type}</td><td>{strength}</td><td>{reasons}</td></tr>"
+
+        table += "</table>"
+        return table
 
     def _generate_price_chart(self, price: pd.DataFrame, tech: pd.DataFrame, profile: Dict, sr: Dict) -> str:
         fig = go.Figure(data=[go.Candlestick(x=price.index, open=price['Open'], high=price['High'], low=price['Low'], close=price['Close'])])
@@ -96,32 +169,51 @@ class ReportGenerator:
         <head>
             <title>{{ ticker }} Trading Plan</title>
             <style>
-                body { font-family: sans-serif; }
-                h1, h2, h3 { color: #333; }
-                table { border-collapse: collapse; width: 50%; margin-bottom: 20px; }
-                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                body { font-family: sans-serif; margin: 0; padding: 0; background-color: #f4f4f9; }
+                .container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding: 20px; }
+                .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                h1, h2, h3, h4 { color: #333; }
+                h1 { text-align: center; grid-column: 1 / -1; }
+                table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 0.9em; }
                 th { background-color: #f2f2f2; }
             </style>
         </head>
         <body>
             <h1>{{ ticker }} Trading Plan - {{ timestamp }}</h1>
-            <p><strong>Current Price:</strong> {{ current_price }}</p>
-            <p><strong>Opening Type:</strong> {{ opening_type }}</p>
-
-            <h2>Signal</h2>
-            <div>{{ signal_section }}</div>
-
-            <h2>Key Levels</h2>
-            <div>{{ key_levels }}</div>
-
-            <h2>Statistics</h2>
-            <div>{{ statistics_tables }}</div>
-
-            <h2>ML Predictions</h2>
-            <div>{{ ml_predictions }}</div>
-
-            <h2>Price Chart</h2>
-            <div id='chart'>{{ chart_script }}</div>
+            <div class="container">
+                <div class="card">
+                    <h2>Signal & Key Info</h2>
+                    <p><strong>Current Price:</strong> {{ current_price }}</p>
+                    <p><strong>Opening Type:</strong> {{ opening_type }}</p>
+                    <div>{{ signal_section }}</div>
+                </div>
+                <div class="card">
+                    <h2>Key Levels</h2>
+                    <div>{{ key_levels }}</div>
+                </div>
+                <div class="card">
+                    <h2>ML Prediction (Next Open)</h2>
+                    <div>{{ ml_predictions_section }}</div>
+                </div>
+                <div class="card">
+                    <h2>Historical Statistics</h2>
+                    <div>{{ statistics_tables }}</div>
+                </div>
+                <div class="card">
+                    <h2>ATR & Fibonacci</h2>
+                    {{ atr_table }}
+                    {{ fibonacci_table }}
+                </div>
+                <div class="card">
+                     <h2>S/R Cluster Zones</h2>
+                    {{ sr_cluster_table }}
+                </div>
+                 <div class="card" style="grid-column: 1 / -1;">
+                    <h2>Price Chart</h2>
+                    <div id='chart'>{{ chart_script }}</div>
+                </div>
+            </div>
         </body>
         </html>
         """
