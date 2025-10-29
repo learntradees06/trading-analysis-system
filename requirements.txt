@@ -10,3 +10,4 @@ scipy
 ta
 xgboost
 rich
+xgboost
