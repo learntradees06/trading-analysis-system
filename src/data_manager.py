@@ -22,7 +22,6 @@ class Database:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
-                # Use WAL mode for better concurrency
                 cls._instance.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
                 cls._instance.conn.execute('PRAGMA journal_mode=WAL;')
                 cls._instance.lock = threading.Lock()
@@ -30,6 +29,16 @@ class Database:
     def get_connection(self): return self.conn
 
 class DataManager:
+    YF_INTERVAL_MAP = {'1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1h': '1h', '4h': '1h', '1d': '1d', '1wk': '1wk'}
+    # Corrected YF_INTERVAL_MAP
+    YF_INTERVAL_MAP = {'1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1h': '1h', '4h': '4h', '1d': '1d', '1wk': '1wk'}
+    YF_MAX_DAYS = {
+        '1m': 7, '5m': 60, '15m': 60, '30m': 60, '1h': 730,
+        '4h': 730, # Assumption for 4h, yfinance does not directly support it
+        '1d': 10000, # Essentially unlimited
+        '1wk': 10000 # Essentially unlimited
+    }
+
     def __init__(self, ticker: str):
         self.ticker = ticker
         self.db = Database()
@@ -43,12 +52,10 @@ class DataManager:
     def _init_database(self):
         with self.db.lock:
             cursor = self.conn.cursor()
-            # Correct schema for cache_metadata (6 columns)
             cursor.execute('''CREATE TABLE IF NOT EXISTS cache_metadata (
                                 ticker TEXT, timeframe TEXT, first_date TIMESTAMP,
                                 last_date TIMESTAMP, last_update TIMESTAMP, total_rows INTEGER,
                                 PRIMARY KEY (ticker, timeframe))''')
-            # Schema with lowercase column names for consistency
             cursor.execute('''CREATE TABLE IF NOT EXISTS ohlcv_data (
                                 ticker TEXT, timeframe TEXT, timestamp TIMESTAMP, open REAL, high REAL,
                                 low REAL, close REAL, volume REAL, PRIMARY KEY (ticker, timeframe, timestamp))''')
@@ -56,32 +63,34 @@ class DataManager:
 
     def fetch_data(self, timeframe: str, days_back: int = 365) -> pd.DataFrame:
         df = self._get_cached_data(timeframe)
-        if not df.empty:
-            logger.info(f"Loaded {len(df)} rows from cache for {self.ticker} {timeframe}")
-            return df.tail(days_back) # Return requested slice
+        if not df.empty and (datetime.now(pytz.UTC) - df.index.max()) < timedelta(minutes=15):
+             logger.info(f"Using fresh cached data for {self.ticker} {timeframe}")
+             return df.tail(days_back)
 
         logger.info(f"Fetching new data for {self.ticker} {timeframe}")
-        yf_interval_map = {'1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1h': '60m', '4h': '60m', '1d': '1d'}
-        yf_interval = yf_interval_map.get(timeframe, '1d')
+        yf_interval = self.YF_INTERVAL_MAP.get(timeframe, '1d')
 
-        # Fetch a bit more data for indicator calculations
-        period_to_fetch = days_back + 100
+        # Respect yfinance API limits
+        max_days = self.YF_MAX_DAYS.get(yf_interval, 365)
+        period_to_fetch = min(days_back + 100, max_days) # Add buffer for indicators, but cap at max_days
 
         new_data = self.yf_ticker.history(period=f"{period_to_fetch}d", interval=yf_interval, auto_adjust=False)
 
         if new_data.empty:
             logger.warning(f"No data returned from yfinance for {self.ticker} {timeframe}")
-            return pd.DataFrame()
+            return df # Return stale cache if available
 
-        # --- Enforce PascalCase Naming Convention for application use ---
         new_data.columns = [col.capitalize() for col in new_data.columns]
         if 'Adj close' in new_data.columns:
             new_data = new_data.rename(columns={'Adj close': 'Adj_close'})
 
-        if new_data.index.tz is None:
-            new_data.index = new_data.index.tz_localize('UTC')
-        else:
-            new_data.index = new_data.index.tz_convert('UTC')
+        if timeframe == '4h': # Aggregate 1h to 4h
+            new_data = new_data.resample('4H').agg({
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+            }).dropna()
+
+        if new_data.index.tz is None: new_data.index = new_data.index.tz_localize('UTC')
+        else: new_data.index = new_data.index.tz_convert('UTC')
 
         self._cache_data(new_data, timeframe)
         return new_data.tail(days_back)
@@ -92,7 +101,6 @@ class DataManager:
             try:
                 df = pd.read_sql(query, self.conn, params=(self.ticker, timeframe), index_col='timestamp', parse_dates=['timestamp'])
                 if not df.empty:
-                    # --- Enforce PascalCase Naming Convention after loading from DB ---
                     df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
                     if df.index.tz is None: df.index = df.index.tz_localize('UTC')
                 return df
@@ -102,18 +110,13 @@ class DataManager:
 
     def _cache_data(self, df: pd.DataFrame, timeframe: str):
         df_to_cache = df.copy()
-
-        # --- Enforce lowercase Naming Convention for DB storage ---
         df_to_cache.columns = [col.lower() for col in df_to_cache.columns]
-
-        # Select only the columns that exist in our DB schema
         db_columns = ['open', 'high', 'low', 'close', 'volume']
         cols_to_keep = [col for col in db_columns if col in df_to_cache.columns]
         df_to_cache = df_to_cache[cols_to_keep]
-
         df_to_cache.reset_index(inplace=True)
-        df_to_cache = df_to_cache.rename(columns={'index': 'timestamp', 'Date': 'timestamp'})
-
+        # Handle both 'index' and 'Datetime' for timestamp column
+        df_to_cache = df_to_cache.rename(columns={'index': 'timestamp', 'Datetime': 'timestamp'})
         df_to_cache['ticker'] = self.ticker
         df_to_cache['timeframe'] = timeframe
 
@@ -121,10 +124,7 @@ class DataManager:
             cursor = self.conn.cursor()
             cursor.execute("DELETE FROM ohlcv_data WHERE ticker = ? AND timeframe = ?", (self.ticker, timeframe))
             cursor.execute("DELETE FROM cache_metadata WHERE ticker = ? AND timeframe = ?", (self.ticker, timeframe))
-
             df_to_cache.to_sql('ohlcv_data', self.conn, if_exists='append', index=False)
-
-            # Correct INSERT statement with 6 values for 6 columns
             cursor.execute("""
                 INSERT INTO cache_metadata (ticker, timeframe, first_date, last_date, last_update, total_rows)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -148,7 +148,6 @@ def get_cache_statistics() -> Dict[str, Dict[str, Any]]:
             rows = cursor.fetchall()
         except sqlite3.OperationalError:
             return {}
-
     summary = {}
     for ticker, timeframe, total_rows, first_date, last_date in rows:
         if ticker not in summary: summary[ticker] = {}
