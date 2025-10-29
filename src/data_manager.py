@@ -1,12 +1,12 @@
 # src/data_manager.py
-"""Data Management Module with Thread-Safe Singleton DB Connection"""
+"""Data Management Module with Thread-Safe Singleton DB Connection and Incremental Caching"""
 import sqlite3
 import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
 import pytz
 import threading
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 import logging
 
@@ -31,10 +31,8 @@ class Database:
 
 class DataManager:
     YF_INTERVAL_MAP = {'1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m', '1h': '1h', '1d': '1d', '1wk': '1wk'}
-    YF_MAX_DAYS = {
-        '1m': 7, '5m': 60, '15m': 60, '30m': 60, '1h': 730,
-        '1d': 10000, '1wk': 10000
-    }
+    YF_MAX_DAYS_INTRADAY = 60 # yfinance limit for intraday < 1h
+    YF_MAX_DAYS_HOURLY = 730 # yfinance limit for 1h
 
     def __init__(self, ticker: str):
         self.ticker = ticker
@@ -58,46 +56,90 @@ class DataManager:
                                 low REAL, close REAL, volume REAL, PRIMARY KEY (ticker, timeframe, timestamp))''')
             self.conn.commit()
 
-    def fetch_data(self, timeframe: str, days_back: int = 365) -> pd.DataFrame:
-        df = self._get_cached_data(timeframe)
+    def fetch_data(self, timeframe: str, days_back: int = 365, use_cache: bool = True) -> pd.DataFrame:
+        """
+        Fetches historical data, using and updating a local cache incrementally.
+        For ML training, you may want to call this with a very large `days_back` value
+        to ensure you get the full cached history.
+        """
+        # 1. Get cached data and metadata
+        cached_df = self._get_cached_data(timeframe) if use_cache else pd.DataFrame()
+        metadata = self._get_cache_metadata(timeframe) if use_cache else {}
 
-        # Define slicing logic based on timeframe
-        if timeframe in ['1d', '1wk']:
-            slicer = lambda d: d.tail(days_back)
-        else:
-            # Convert trading days to calendar days for a rough estimate
-            calendar_days = int(days_back * 365.25 / 252) + 5 # Add a small buffer
-            cutoff_date = datetime.now(pytz.UTC) - timedelta(days=calendar_days)
-            slicer = lambda d: d[d.index >= cutoff_date]
+        last_cached_date = pd.to_datetime(metadata.get('last_date'), utc=True) if metadata.get('last_date') else None
 
-        if not df.empty and (datetime.now(pytz.UTC) - df.index.max()) < timedelta(minutes=15):
-             logger.info(f"Using fresh cached data for {self.ticker} {timeframe}")
-             return slicer(df)
+        # 2. Determine if the cache is fresh enough
+        is_fresh = last_cached_date and (datetime.now(pytz.UTC) - last_cached_date) < timedelta(minutes=15)
 
-        logger.info(f"Fetching new data for {self.ticker} {timeframe}")
+        # 3. Define the slicing logic for the final output
+        slicer = self._get_slicer(timeframe, days_back)
+
+        # 4. If cache is fresh, return sliced data from the complete cached set
+        if not cached_df.empty and is_fresh:
+            logger.info(f"Using fresh cached data for {self.ticker} {timeframe}")
+            return slicer(cached_df)
+
+        # 5. Determine the start date for the API call
+        start_date = None
+        if last_cached_date:
+            # Fetch one extra day to handle potential partial data
+            start_date = (last_cached_date - timedelta(days=1)).strftime('%Y-%m-%d')
+
         yf_interval = self.YF_INTERVAL_MAP.get(timeframe)
         if not yf_interval:
             logger.error(f"Invalid timeframe requested: {timeframe}")
             return pd.DataFrame()
 
-        max_days = self.YF_MAX_DAYS.get(yf_interval, 365)
-        period_to_fetch = min(days_back + 100, max_days)
-
-        new_data = self.yf_ticker.history(period=f"{period_to_fetch}d", interval=yf_interval, auto_adjust=False)
+        # 6. Fetch new data from yfinance
+        logger.info(f"Fetching new data for {self.ticker} {timeframe} since {start_date or 'beginning'}")
+        new_data = self._fetch_yf_data(yf_interval, start_date)
 
         if new_data.empty:
-            logger.warning(f"No data returned from yfinance for {self.ticker} {timeframe}")
-            return slicer(df) if not df.empty else pd.DataFrame()
+            logger.warning(f"No new data returned from yfinance for {self.ticker} {timeframe}")
+            return slicer(cached_df) if not cached_df.empty else pd.DataFrame()
 
+        # 7. Process and combine data
+        new_data = self._process_new_data(new_data)
+        combined_df = pd.concat([cached_df, new_data])
+        combined_df = combined_df[~combined_df.index.duplicated(keep='last')].sort_index()
+
+        # 8. Cache the new combined data
+        if use_cache:
+            self._cache_data(new_data, timeframe) # Only cache the newly downloaded portion
+
+        return slicer(combined_df)
+
+    def _get_slicer(self, timeframe: str, days_back: int):
+        """Returns a lambda function to slice a DataFrame correctly based on timeframe."""
+        if timeframe in ['1d', '1wk']:
+            return lambda d: d.tail(days_back)
+        else:
+            calendar_days = int(days_back * 365.25 / 252) + 5
+            cutoff_date = datetime.now(pytz.UTC) - timedelta(days=calendar_days)
+            return lambda d: d[d.index >= cutoff_date]
+
+    def _fetch_yf_data(self, yf_interval: str, start_date: Optional[str]) -> pd.DataFrame:
+        """Handles the actual data fetching from yfinance with appropriate params."""
+        fetch_params = {"interval": yf_interval, "auto_adjust": False}
+        if start_date:
+             fetch_params['start'] = start_date
+        elif yf_interval in ['1m', '5m', '15m', '30m']:
+            fetch_params['period'] = f"{self.YF_MAX_DAYS_INTRADAY}d"
+        elif yf_interval == '1h':
+             fetch_params['period'] = f"{self.YF_MAX_DAYS_HOURLY}d"
+        else:
+             fetch_params['period'] = "max"
+        return self.yf_ticker.history(**fetch_params)
+
+    def _process_new_data(self, new_data: pd.DataFrame) -> pd.DataFrame:
+        """Standardizes columns and timezone for a new DataFrame from yfinance."""
         new_data.columns = [col.capitalize() for col in new_data.columns]
         if 'Adj close' in new_data.columns:
-            new_data = new_data.rename(columns={'Adj close': 'Adj_close'})
+            new_data.rename(columns={'Adj close': 'Adj_close'}, inplace=True)
 
-        if new_data.index.tz is None: new_data.index = new_data.index.tz_localize('UTC')
-        else: new_data.index = new_data.index.tz_convert('UTC')
-
-        self._cache_data(new_data, timeframe)
-        return slicer(new_data)
+        if new_data.index.tz is None:
+            return new_data.tz_localize('UTC')
+        return new_data.tz_convert('UTC')
 
     def _get_cached_data(self, timeframe: str) -> pd.DataFrame:
         query = "SELECT timestamp, open, high, low, close, volume FROM ohlcv_data WHERE ticker = ? AND timeframe = ? ORDER BY timestamp"
@@ -112,30 +154,56 @@ class DataManager:
                 logger.warning(f"Could not read from cache for {self.ticker} {timeframe}: {e}")
                 return pd.DataFrame()
 
+    def _get_cache_metadata(self, timeframe: str) -> Dict:
+        """Retrieves the metadata for a given ticker and timeframe."""
+        query = "SELECT * FROM cache_metadata WHERE ticker = ? AND timeframe = ?"
+        with self.db.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(query, (self.ticker, timeframe))
+                row = cursor.fetchone()
+                if row:
+                    cols = [desc[0] for desc in cursor.description]
+                    return dict(zip(cols, row))
+            except Exception as e:
+                logger.warning(f"Could not read metadata for {self.ticker} {timeframe}: {e}")
+        return {}
+
     def _cache_data(self, df: pd.DataFrame, timeframe: str):
+        """Caches new data incrementally using an upsert operation and updates metadata."""
+        if df.empty: return
+
         df_to_cache = df.copy()
         df_to_cache.columns = [col.lower() for col in df_to_cache.columns]
         db_columns = ['open', 'high', 'low', 'close', 'volume']
-        cols_to_keep = [col for col in db_columns if col in df_to_cache.columns]
-        df_to_cache = df_to_cache[cols_to_keep]
+        df_to_cache = df_to_cache[[col for col in db_columns if col in df_to_cache.columns]]
         df_to_cache.reset_index(inplace=True)
-        # The index column from yfinance can have various names ('Date', 'Datetime', or 'index').
-        # After reset_index(), this column is always at position 0. We robustly rename it to 'timestamp'.
         df_to_cache.rename(columns={df_to_cache.columns[0]: 'timestamp'}, inplace=True)
         df_to_cache['ticker'] = self.ticker
         df_to_cache['timeframe'] = timeframe
 
         with self.db.lock:
+            df_to_cache.to_sql('ohlcv_data', self.conn, if_exists='append', index=False, method=self._sqlite_upsert)
+
             cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM ohlcv_data WHERE ticker = ? AND timeframe = ?", (self.ticker, timeframe))
-            cursor.execute("DELETE FROM cache_metadata WHERE ticker = ? AND timeframe = ?", (self.ticker, timeframe))
-            df_to_cache.to_sql('ohlcv_data', self.conn, if_exists='append', index=False)
+            cursor.execute("SELECT MIN(timestamp), MAX(timestamp), COUNT(*) FROM ohlcv_data WHERE ticker = ? AND timeframe = ?", (self.ticker, timeframe))
+            first_date, last_date, total_rows = cursor.fetchone()
+
             cursor.execute("""
-                INSERT INTO cache_metadata (ticker, timeframe, first_date, last_date, last_update, total_rows)
+                INSERT OR REPLACE INTO cache_metadata (ticker, timeframe, first_date, last_date, last_update, total_rows)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (self.ticker, timeframe, df.index.min().isoformat(), df.index.max().isoformat(), datetime.now().isoformat(), len(df)))
+            """, (self.ticker, timeframe, first_date, last_date, datetime.now().isoformat(), total_rows))
             self.conn.commit()
-        logger.info(f"Cached {len(df)} rows for {self.ticker} {timeframe}")
+
+        logger.info(f"Upserted {len(df_to_cache)} rows for {self.ticker} {timeframe}. Total cached rows: {total_rows}")
+
+    @staticmethod
+    def _sqlite_upsert(table, conn, keys, data_iter):
+        """Performs an 'upsert' (INSERT OR REPLACE) operation for sqlite."""
+        column_names = ", ".join(keys)
+        placeholders = ", ".join(["?"] * len(keys))
+        sql = f"INSERT OR REPLACE INTO {table.name} ({column_names}) VALUES ({placeholders})"
+        conn.executemany(sql, data_iter)
 
     def get_rth_data(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty: return df

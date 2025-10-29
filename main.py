@@ -307,11 +307,15 @@ class TradingSystem:
             settings = INSTRUMENT_SETTINGS.get(self.ticker, {"tick_size": 0.01, "rth_start": "08:30", "rth_end": "15:00", "timezone": "US/Central"})
             market_profile = MarketProfile(self.ticker, settings['tick_size'])
             ml_predictor = MLPredictor(self.ticker, MODELS_DIR)
+            stats_analyzer = StatisticalAnalyzer(self.ticker)
 
-            # Fetch ample data for feature creation
-            daily_data = data_manager.fetch_data('1d', days_back=730)
-            thirty_min_data = data_manager.fetch_data('30m', days_back=730)
-            if daily_data.empty or len(daily_data) < 100: # Need at least 100 days for a decent training set
+            # Fetch all available historical data from the cache for robust training
+            print("Fetching the maximum available historical data for training...")
+            days_for_training = 252 * 10 # 10 years of trading days
+            daily_data = data_manager.fetch_data('1d', days_back=days_for_training)
+            thirty_min_data = data_manager.fetch_data('30m', days_back=days_for_training)
+
+            if daily_data.empty or len(daily_data) < 100: # Still need a minimum amount of data
                 print("Error: Not enough historical data (<100 days) to train the model."); return
 
             print("Step 2/3: Generating profiles, indicators, and statistics...")
