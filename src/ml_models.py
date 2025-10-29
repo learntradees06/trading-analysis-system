@@ -31,15 +31,40 @@ class MLPredictor:
 
     def create_features(self, profiles: List[Dict], technical_data: pd.DataFrame, all_stats: Dict) -> pd.DataFrame:
         features_list = []
+        dropped_count = 0
+        total_potential = len(profiles) - 2 # We need a prior and next day for each sample
+
         for i in range(1, len(profiles) - 1):
             current_profile = profiles[i]
             prior_profile = profiles[i-1]
             next_day_profile = profiles[i+1]
+            current_date_str = current_profile.get('date', 'Unknown Date').strftime('%Y-%m-%d')
+
+            # --- Data Quality and Consistency Checks ---
+            if not all(k in current_profile for k in ['poc', 'val', 'vah', 'session_close', 'session_high', 'session_low', 'ib_range']):
+                logger.debug(f"Skipping {current_date_str}: Missing key data in current day's profile.")
+                dropped_count += 1
+                continue
 
             tech_row = technical_data[technical_data.index.date == current_profile['date'].date()]
             if tech_row.empty:
+                logger.debug(f"Skipping {current_date_str}: No matching technical data row found.")
+                dropped_count += 1
                 continue
             tech_row = tech_row.iloc[0]
+
+            opening_type = current_profile.get('opening_type', 'Unknown')
+            if opening_type == 'Unknown':
+                logger.debug(f"Skipping {current_date_str}: Opening type is 'Unknown'.")
+                dropped_count += 1
+                continue
+
+            target_opening_type = next_day_profile.get('opening_type')
+            if not target_opening_type or target_opening_type not in self.opening_classes:
+                logger.debug(f"Skipping {current_date_str}: Invalid or missing target opening type ('{target_opening_type}') on next day.")
+                dropped_count += 1
+                continue
+            # --- End Checks ---
 
             features = {
                 'poc_migration_norm': (current_profile['poc'] - prior_profile['poc']) / tech_row.get('ATR', 1),
@@ -54,19 +79,19 @@ class MLPredictor:
                 'volume_change_pct': tech_row.get('Volume_pct_change', 0),
             }
 
-            opening_type = current_profile.get('opening_type', 'Unknown')
-            if opening_type != 'Unknown':
-                prob_features = self.stats_analyzer.get_probabilities_for_day(opening_type, all_stats)
-                features.update(prob_features)
+            prob_features = self.stats_analyzer.get_probabilities_for_day(opening_type, all_stats)
+            features.update(prob_features)
 
-            target_opening_type = next_day_profile.get('opening_type')
-            if target_opening_type in self.opening_classes:
-                features['target_opening_type'] = target_opening_type
-                features_list.append(features)
+            features['target_opening_type'] = target_opening_type
+            features_list.append(features)
+
+        logger.info(f"Feature Creation Summary: Processed {total_potential} potential samples. "
+                    f"Successfully created {len(features_list)} samples. Dropped {dropped_count} due to data quality issues.")
+
+        if not features_list:
+            return pd.DataFrame()
 
         df = pd.DataFrame(features_list)
-        if df.empty:
-            return pd.DataFrame()
 
         if not self.feature_cols:
             self.feature_cols = [col for col in df.columns if 'target' not in col]

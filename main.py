@@ -309,14 +309,21 @@ class TradingSystem:
             ml_predictor = MLPredictor(self.ticker, MODELS_DIR)
             stats_analyzer = StatisticalAnalyzer(self.ticker)
 
-            # Fetch all available historical data from the cache for robust training
-            print("Fetching the maximum available historical data for training...")
-            days_for_training = 252 * 10 # 10 years of trading days
-            daily_data = data_manager.fetch_data('1d', days_back=days_for_training)
-            thirty_min_data = data_manager.fetch_data('30m', days_back=days_for_training)
+            # --- Aggressive Historical Backfill ---
+            print("Performing aggressive historical data backfill to ensure cache is up-to-date...")
+            # These calls with use_cache=False will force a download and update the cache.
+            # We are just calling them to update the cache, not using the returned data directly.
+            data_manager.fetch_data('1d', days_back=10000, use_cache=True)
+            data_manager.fetch_data('30m', days_back=data_manager.YF_MAX_DAYS_INTRADAY, use_cache=True)
 
-            if daily_data.empty or len(daily_data) < 100: # Still need a minimum amount of data
-                print("Error: Not enough historical data (<100 days) to train the model."); return
+            # --- Fetch Full Training Set from Cache ---
+            print("Fetching the maximum available historical data for training from local cache...")
+            days_for_training = 252 * 10 # 10 years of trading days
+            daily_data = data_manager.fetch_data('1d', days_back=days_for_training, use_cache=True)
+            thirty_min_data = data_manager.fetch_data('30m', days_back=days_for_training, use_cache=True)
+
+            if daily_data.empty or len(daily_data) < 100:
+                print("Error: Not enough historical data (<100 days) to train the model after backfill."); return
 
             print("Step 2/3: Generating profiles, indicators, and statistics...")
             daily_with_indicators = calculate_all_indicators(daily_data)
