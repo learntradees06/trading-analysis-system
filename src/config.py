@@ -20,7 +20,7 @@ for dir_path in [DATA_CACHE_DIR, MODELS_DIR, REPORTS_DIR]:
 DB_PATH = DATA_CACHE_DIR / "market_data.db"
 
 # Notification settings
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1422203042270548089/SU8WVNF3XJrdn_uXg9SlXLVD8g0HxFeum0lPyOth93JVmz8f1bUgpk3qSRwMXCr-WoXn"
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")  # Can use environment variable
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
