@@ -57,7 +57,7 @@ class TradingSystem:
         print("[7] Set New Ticker")
         print("[8] Configure Notifications")
         print("[9] View Cached Data Summary")
-        print("[10] Update All Cached Data")
+        print("[10] Manage Data Cache")
         print("[11] Exit")
 
     def _run_single_ticker_analysis(self, ticker: str, generate_report: bool = False) -> Dict:
@@ -240,12 +240,35 @@ class TradingSystem:
         analysis_result = self._run_single_ticker_analysis(self.ticker, generate_report=True)
         if "error" in analysis_result:
             print(f"\n❌ Error generating trading plan: {analysis_result['error']}"); return
+
+        # --- Calculate Developing Profile ---
+        developing_profile = {}
+        try:
+            data_manager = DataManager(self.ticker)
+            settings = INSTRUMENT_SETTINGS.get(self.ticker, {"tick_size": 0.01, "rth_start": "08:30", "rth_end": "15:00", "timezone": "US/Central"})
+            market_profile = MarketProfile(self.ticker, settings['tick_size'])
+
+            # Fetch very recent intraday data for today
+            today_intraday = data_manager.fetch_data('5m', days_back=2)
+            today_date = pd.Timestamp.now(tz='UTC').date()
+            today_data = today_intraday[today_intraday.index.date == today_date]
+
+            if not today_data.empty:
+                rth_today = data_manager.get_rth_data(today_data)
+                if not rth_today.empty:
+                    developing_profile = market_profile.calculate_tpo_profile(rth_today, pd.Timestamp.now(tz='UTC'))
+
+        except Exception as e:
+            print(f"⚠️ Warning: Could not calculate developing profile: {e}")
+        # --- End Developing Profile ---
+
         self._display_signal_summary(analysis_result['signal'])
         print("\n📝 Creating detailed HTML report...")
         try:
             report_path = report_generator.generate_report(
                 signal=analysis_result['signal'],
                 current_profile=analysis_result['current_profile'],
+                developing_profile=developing_profile, # Pass new data
                 daily_with_indicators=analysis_result['daily_with_indicators'],
                 sr_analysis=analysis_result['sr_analysis'],
                 ml_predictions=analysis_result['ml_predictions'],
@@ -534,7 +557,55 @@ class TradingSystem:
         except Exception as e:
             print(f"\n❌ An error occurred while fetching cache summary: {e}")
 
-    def update_all_cached_data(self):
+    def manage_data_cache(self):
+        """Display the data cache management sub-menu."""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("\n" + "="*40); print("      DATA CACHE MANAGEMENT"); print("="*40)
+            self._view_cached_tickers()
+            print("\n" + "-"*40)
+            print("[1] Add New Tickers to Cache")
+            print("[2] Update All Cached Data")
+            print("[3] Back to Main Menu")
+            print("-" * 40)
+            choice = input("Enter choice: ").strip()
+
+            if choice == '1':
+                self._add_tickers_to_cache()
+                input("\nPress Enter to continue...")
+            elif choice == '2':
+                self._update_all_cached_data()
+                input("\nPress Enter to continue...")
+            elif choice == '3':
+                break
+            else:
+                print("\n⚠️ Invalid choice. Please try again.")
+                time.sleep(1)
+
+    def _view_cached_tickers(self):
+        """Helper to view all tickers in the cache."""
+        summary = get_cache_statistics()
+        if not summary:
+            print("\nNo cached data found.")
+            return False
+
+        print("\nTickers currently in cache:")
+        print(", ".join(sorted(summary.keys())))
+        return True
+
+    def _add_tickers_to_cache(self):
+        """Prompt user for new tickers and download their data."""
+        print("\n--- Add New Tickers to Cache ---")
+        tickers_str = input("Enter one or more tickers to download (comma-separated, e.g., MSFT,GOOGL): ").strip().upper()
+        if not tickers_str:
+            print("\n⚠️ No tickers entered."); return
+
+        tickers = [t.strip() for t in tickers_str.split(',') if t.strip()]
+        print(f"\nStarting download for {len(tickers)} tickers...")
+        self._update_tickers_data(tickers)
+        print("\n✅ Download complete.")
+
+    def _update_all_cached_data(self):
         """Iterates through all tickers in the cache and updates their data."""
         print("\n--- Updating All Cached Data ---")
         summary = get_cache_statistics()
@@ -543,8 +614,12 @@ class TradingSystem:
 
         tickers_to_update = list(summary.keys())
         print(f"Found {len(tickers_to_update)} tickers to update: {', '.join(tickers_to_update)}")
+        self._update_tickers_data(tickers_to_update)
+        print("\n--- All tickers updated. ---")
 
-        for ticker in tickers_to_update:
+    def _update_tickers_data(self, tickers: List[str]):
+        """Helper function to fetch data for a list of tickers."""
+        for ticker in tickers:
             print(f"\nUpdating data for {ticker}...")
             try:
                 data_manager = DataManager(ticker)
@@ -557,9 +632,6 @@ class TradingSystem:
                 print(f"✅ Finished updating {ticker}.")
             except Exception as e:
                 print(f"❌ Failed to update {ticker}: {e}")
-
-        print("\n--- All tickers updated. ---")
-
 
     def _display_signal_summary(self, signal: Dict):
         """Display signal summary in console"""
@@ -576,7 +648,7 @@ class TradingSystem:
                 '3': self.generate_single_ticker_plan, '4': self.view_historical_statistics,
                 '5': self.train_ml_models_for_ticker, '6': self.manage_watchlists,
                 '7': self.set_new_ticker, '8': self.configure_notifications,
-                '9': self.view_cache_summary, '10': self.update_all_cached_data
+                '9': self.view_cache_summary, '10': self.manage_data_cache
             }.get(choice)
 
             if choice == '11': print("\n👋 Goodbye!"); break
