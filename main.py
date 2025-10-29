@@ -57,7 +57,8 @@ class TradingSystem:
         print("[7] Set New Ticker")
         print("[8] Configure Notifications")
         print("[9] View Cached Data Summary")
-        print("[10] Exit")
+        print("[10] Update All Cached Data")
+        print("[11] Exit")
 
     def _run_single_ticker_analysis(self, ticker: str, generate_report: bool = False) -> Dict:
         """The core analysis logic for a single ticker."""
@@ -72,14 +73,14 @@ class TradingSystem:
         try:
             timeframes = ['1wk', '1d', '1h', '30m', '15m', '5m']
             data = {tf: data_manager.fetch_data(tf, days_back=252) for tf in timeframes}
-            if data['1d'].empty or data['30m'].empty: return {"error": "Insufficient base data."}
+            if data['1d'].empty or data['30m'].empty or data['1h'].empty: return {"error": "Insufficient base data."}
 
             daily_with_indicators = calculate_all_indicators(data['1d'])
+            hourly_with_indicators = calculate_all_indicators(data['1h'])
             profiles, _ = self._generate_profiles(data['1d'], data['30m'], data_manager, market_profile)
             statistics = stats_analyzer.calculate_opening_type_statistics(profiles)
 
-            # Create features for the most recent day for opening type prediction
-            prediction_features = ml_predictor.create_prediction_features(profiles, daily_with_indicators, statistics)
+            prediction_features = ml_predictor.create_prediction_features(profiles, daily_with_indicators, hourly_with_indicators, statistics)
             ml_predictions = self._get_ml_predictions(ml_predictor, prediction_features)
 
             current_profile = profiles[-1] if profiles else {}
@@ -295,12 +296,15 @@ class TradingSystem:
             traceback.print_exc()
 
     def train_ml_models_for_ticker(self):
-        """Train the new multiclass opening type prediction model."""
+        """Interactive wrapper for ML model training."""
         print(f"\n--- Training Opening Type Prediction Model for {self.ticker} ---")
-        confirm = input(f"This will train a new opening type prediction model for {self.ticker}. This requires significant historical data (at least 2 years recommended). Continue? (y/n): ").lower()
+        confirm = input(f"This will train a new model for {self.ticker}. This requires significant historical data and may take some time. Continue? (y/n): ").lower()
         if confirm != 'y':
             print("Training cancelled."); return
+        self._run_ml_training()
 
+    def _run_ml_training(self):
+        """The core, non-interactive logic for training the ML model."""
         try:
             print("Step 1/3: Initializing components and fetching data...")
             data_manager = DataManager(self.ticker)
@@ -309,32 +313,31 @@ class TradingSystem:
             ml_predictor = MLPredictor(self.ticker, MODELS_DIR)
             stats_analyzer = StatisticalAnalyzer(self.ticker)
 
-            # --- Aggressive Historical Backfill ---
-            print("Performing aggressive historical data backfill to ensure cache is up-to-date...")
-            # These calls with use_cache=False will force a download and update the cache.
-            # We are just calling them to update the cache, not using the returned data directly.
-            data_manager.fetch_data('1d', days_back=10000, use_cache=True)
-            data_manager.fetch_data('30m', days_back=data_manager.YF_MAX_DAYS_INTRADAY, use_cache=True)
+            print("Performing aggressive historical data backfill...")
+            data_manager.fetch_data('1d', days_back=10000)
+            data_manager.fetch_data('1h', days_back=data_manager.YF_MAX_DAYS_HOURLY)
+            data_manager.fetch_data('30m', days_back=data_manager.YF_MAX_DAYS_INTRADAY)
 
-            # --- Fetch Full Training Set from Cache ---
-            print("Fetching the maximum available historical data for training from local cache...")
-            days_for_training = 252 * 10 # 10 years of trading days
-            daily_data = data_manager.fetch_data('1d', days_back=days_for_training, use_cache=True)
-            thirty_min_data = data_manager.fetch_data('30m', days_back=days_for_training, use_cache=True)
+            print("Fetching full training dataset from cache...")
+            days_for_training = 252 * 10
+            daily_data = data_manager.fetch_data('1d', days_back=days_for_training)
+            thirty_min_data = data_manager.fetch_data('30m', days_back=days_for_training)
+            one_hour_data = data_manager.fetch_data('1h', days_back=days_for_training)
 
-            if daily_data.empty or len(daily_data) < 100:
-                print("Error: Not enough historical data (<100 days) to train the model after backfill."); return
+            if daily_data.empty or thirty_min_data.empty or one_hour_data.empty or len(daily_data) < 100:
+                print("Error: Not enough historical data (<100 days) to train."); return
 
             print("Step 2/3: Generating profiles, indicators, and statistics...")
             daily_with_indicators = calculate_all_indicators(daily_data)
+            hourly_with_indicators = calculate_all_indicators(one_hour_data)
             profiles, _ = self._generate_profiles(daily_data, thirty_min_data, data_manager, market_profile)
             statistics = stats_analyzer.calculate_opening_type_statistics(profiles)
 
             print("Step 3/3: Creating feature set and training model...")
-            full_feature_set = ml_predictor.create_features(profiles, daily_with_indicators, statistics)
+            full_feature_set = ml_predictor.create_features(profiles, daily_with_indicators, hourly_with_indicators, statistics)
 
-            if full_feature_set.empty or len(full_feature_set) < 50:
-                print("Error: Failed to create a sufficiently large feature set (<50 samples). More data may be required."); return
+            if full_feature_set.empty or len(full_feature_set) < 40:
+                print(f"Error: Failed to create a sufficiently large feature set ({len(full_feature_set)} samples found, but 40 are required). More data may be required."); return
 
             ml_predictor.train_model(full_feature_set)
             print(f"\n✅ Model for {self.ticker} trained and saved successfully.")
@@ -531,6 +534,33 @@ class TradingSystem:
         except Exception as e:
             print(f"\n❌ An error occurred while fetching cache summary: {e}")
 
+    def update_all_cached_data(self):
+        """Iterates through all tickers in the cache and updates their data."""
+        print("\n--- Updating All Cached Data ---")
+        summary = get_cache_statistics()
+        if not summary:
+            print("No cached data to update."); return
+
+        tickers_to_update = list(summary.keys())
+        print(f"Found {len(tickers_to_update)} tickers to update: {', '.join(tickers_to_update)}")
+
+        for ticker in tickers_to_update:
+            print(f"\nUpdating data for {ticker}...")
+            try:
+                data_manager = DataManager(ticker)
+                # Update all key timeframes
+                data_manager.fetch_data('1d', days_back=10000)
+                data_manager.fetch_data('1h', days_back=data_manager.YF_MAX_DAYS_HOURLY)
+                data_manager.fetch_data('30m', days_back=data_manager.YF_MAX_DAYS_INTRADAY)
+                data_manager.fetch_data('15m', days_back=data_manager.YF_MAX_DAYS_INTRADAY)
+                data_manager.fetch_data('5m', days_back=data_manager.YF_MAX_DAYS_INTRADAY)
+                print(f"✅ Finished updating {ticker}.")
+            except Exception as e:
+                print(f"❌ Failed to update {ticker}: {e}")
+
+        print("\n--- All tickers updated. ---")
+
+
     def _display_signal_summary(self, signal: Dict):
         """Display signal summary in console"""
         # ... (implementation restored)
@@ -540,16 +570,16 @@ class TradingSystem:
         """Main application loop."""
         while True:
             self.display_menu()
-            choice = input("\nEnter choice (1-10): ").strip()
+            choice = input("\nEnter choice (1-11): ").strip()
             action = {
                 '1': self.analyze_watchlist_and_display, '2': self.start_multi_ticker_scanner,
                 '3': self.generate_single_ticker_plan, '4': self.view_historical_statistics,
                 '5': self.train_ml_models_for_ticker, '6': self.manage_watchlists,
                 '7': self.set_new_ticker, '8': self.configure_notifications,
-                '9': self.view_cache_summary
+                '9': self.view_cache_summary, '10': self.update_all_cached_data
             }.get(choice)
 
-            if choice == '10': print("\n👋 Goodbye!"); break
+            if choice == '11': print("\n👋 Goodbye!"); break
 
             if action:
                 action()

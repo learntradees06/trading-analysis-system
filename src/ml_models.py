@@ -29,29 +29,35 @@ class MLPredictor:
         self.encoder.fit(self.opening_classes)
         self.stats_analyzer = StatisticalAnalyzer(ticker)
 
-    def create_features(self, profiles: List[Dict], technical_data: pd.DataFrame, all_stats: Dict) -> pd.DataFrame:
+    def create_features(self, profiles: List[Dict], daily_technicals: pd.DataFrame, hourly_technicals: pd.DataFrame, all_stats: Dict) -> pd.DataFrame:
         features_list = []
         dropped_count = 0
-        total_potential = len(profiles) - 2 # We need a prior and next day for each sample
+        total_potential = len(profiles) - 2
 
         for i in range(1, len(profiles) - 1):
             current_profile = profiles[i]
             prior_profile = profiles[i-1]
             next_day_profile = profiles[i+1]
-            current_date_str = current_profile.get('date', 'Unknown Date').strftime('%Y-%m-%d')
+            current_date = current_profile.get('date')
+            if not current_date:
+                dropped_count += 1
+                continue
 
-            # --- Data Quality and Consistency Checks ---
+            current_date_str = current_date.strftime('%Y-%m-%d')
+
             if not all(k in current_profile for k in ['poc', 'val', 'vah', 'session_close', 'session_high', 'session_low', 'ib_range']):
                 logger.debug(f"Skipping {current_date_str}: Missing key data in current day's profile.")
                 dropped_count += 1
                 continue
 
-            tech_row = technical_data[technical_data.index.date == current_profile['date'].date()]
-            if tech_row.empty:
+            daily_tech_row = daily_technicals[daily_technicals.index.date == current_date.date()]
+            hourly_tech_row = hourly_technicals[hourly_technicals.index.date == current_date.date()]
+            if daily_tech_row.empty or hourly_tech_row.empty:
                 logger.debug(f"Skipping {current_date_str}: No matching technical data row found.")
                 dropped_count += 1
                 continue
-            tech_row = tech_row.iloc[0]
+            daily_tech_row = daily_tech_row.iloc[-1] # Use last row of the day
+            hourly_tech_row = hourly_tech_row.iloc[-1]
 
             opening_type = current_profile.get('opening_type', 'Unknown')
             if opening_type == 'Unknown':
@@ -64,19 +70,21 @@ class MLPredictor:
                 logger.debug(f"Skipping {current_date_str}: Invalid or missing target opening type ('{target_opening_type}') on next day.")
                 dropped_count += 1
                 continue
-            # --- End Checks ---
 
             features = {
-                'poc_migration_norm': (current_profile['poc'] - prior_profile['poc']) / tech_row.get('ATR', 1),
-                'va_width_norm': current_profile['va_width'] / tech_row.get('ATR', 1),
-                'ib_range_norm': current_profile['ib_range'] / tech_row.get('ATR', 1),
+                'poc_migration_norm': (current_profile['poc'] - prior_profile['poc']) / daily_tech_row.get('ATR', 1),
+                'va_width_norm': current_profile['va_width'] / daily_tech_row.get('ATR', 1),
+                'ib_range_norm': current_profile['ib_range'] / daily_tech_row.get('ATR', 1),
                 'close_in_value_area': 1 if current_profile['val'] <= current_profile['session_close'] <= current_profile['vah'] else 0,
-                'close_vs_poc': (current_profile['session_close'] - current_profile['poc']) / tech_row.get('ATR', 1),
-                'high_vs_vah': (current_profile['session_high'] - current_profile['vah']) / tech_row.get('ATR', 1),
-                'low_vs_val': (current_profile['session_low'] - current_profile['val']) / tech_row.get('ATR', 1),
-                'rsi': tech_row.get('RSI', 50),
-                'adx': tech_row.get('ADX', 25),
-                'volume_change_pct': tech_row.get('Volume_pct_change', 0),
+                'close_vs_poc': (current_profile['session_close'] - current_profile['poc']) / daily_tech_row.get('ATR', 1),
+                'high_vs_vah': (current_profile['session_high'] - current_profile['vah']) / daily_tech_row.get('ATR', 1),
+                'low_vs_val': (current_profile['session_low'] - current_profile['val']) / daily_tech_row.get('ATR', 1),
+                'daily_rsi': daily_tech_row.get('RSI', 50),
+                'daily_adx': daily_tech_row.get('ADX', 25),
+                'volume_change_pct': daily_tech_row.get('Volume_pct_change', 0),
+                'hourly_rsi': hourly_tech_row.get('RSI', 50),
+                'hourly_adx': hourly_tech_row.get('ADX', 25),
+                'close_vs_hourly_ema': (current_profile['session_close'] - hourly_tech_row.get('EMA_21', current_profile['session_close'])) / daily_tech_row.get('ATR', 1),
             }
 
             prob_features = self.stats_analyzer.get_probabilities_for_day(opening_type, all_stats)
@@ -92,7 +100,6 @@ class MLPredictor:
             return pd.DataFrame()
 
         df = pd.DataFrame(features_list)
-
         if not self.feature_cols:
             self.feature_cols = [col for col in df.columns if 'target' not in col]
 
@@ -100,29 +107,34 @@ class MLPredictor:
         df['target_opening_type_encoded'] = self.encoder.transform(df['target_opening_type'])
         return df
 
-    def create_prediction_features(self, profiles: List[Dict], technical_data: pd.DataFrame, all_stats: Dict) -> pd.DataFrame:
+    def create_prediction_features(self, profiles: List[Dict], daily_technicals: pd.DataFrame, hourly_technicals: pd.DataFrame, all_stats: Dict) -> pd.DataFrame:
         if len(profiles) < 2:
             return pd.DataFrame()
 
         current_profile = profiles[-1]
         prior_profile = profiles[-2]
 
-        tech_row = technical_data[technical_data.index.date == current_profile['date'].date()]
-        if tech_row.empty:
+        daily_tech_row = daily_technicals[daily_technicals.index.date == current_profile['date'].date()]
+        hourly_tech_row = hourly_technicals[hourly_technicals.index.date == current_profile['date'].date()]
+        if daily_tech_row.empty or hourly_tech_row.empty:
             return pd.DataFrame()
-        tech_row = tech_row.iloc[0]
+        daily_tech_row = daily_tech_row.iloc[-1]
+        hourly_tech_row = hourly_tech_row.iloc[-1]
 
         features = {
-            'poc_migration_norm': (current_profile['poc'] - prior_profile['poc']) / tech_row.get('ATR', 1),
-            'va_width_norm': current_profile['va_width'] / tech_row.get('ATR', 1),
-            'ib_range_norm': current_profile['ib_range'] / tech_row.get('ATR', 1),
+            'poc_migration_norm': (current_profile['poc'] - prior_profile['poc']) / daily_tech_row.get('ATR', 1),
+            'va_width_norm': current_profile['va_width'] / daily_tech_row.get('ATR', 1),
+            'ib_range_norm': current_profile['ib_range'] / daily_tech_row.get('ATR', 1),
             'close_in_value_area': 1 if current_profile['val'] <= current_profile['session_close'] <= current_profile['vah'] else 0,
-            'close_vs_poc': (current_profile['session_close'] - current_profile['poc']) / tech_row.get('ATR', 1),
-            'high_vs_vah': (current_profile['session_high'] - current_profile['vah']) / tech_row.get('ATR', 1),
-            'low_vs_val': (current_profile['session_low'] - current_profile['val']) / tech_row.get('ATR', 1),
-            'rsi': tech_row.get('RSI', 50),
-            'adx': tech_row.get('ADX', 25),
-            'volume_change_pct': tech_row.get('Volume_pct_change', 0),
+            'close_vs_poc': (current_profile['session_close'] - current_profile['poc']) / daily_tech_row.get('ATR', 1),
+            'high_vs_vah': (current_profile['session_high'] - current_profile['vah']) / daily_tech_row.get('ATR', 1),
+            'low_vs_val': (current_profile['session_low'] - current_profile['val']) / daily_tech_row.get('ATR', 1),
+            'daily_rsi': daily_tech_row.get('RSI', 50),
+            'daily_adx': daily_tech_row.get('ADX', 25),
+            'volume_change_pct': daily_tech_row.get('Volume_pct_change', 0),
+            'hourly_rsi': hourly_tech_row.get('RSI', 50),
+            'hourly_adx': hourly_tech_row.get('ADX', 25),
+            'close_vs_hourly_ema': (current_profile['session_close'] - hourly_tech_row.get('EMA_21', current_profile['session_close'])) / daily_tech_row.get('ATR', 1),
         }
 
         opening_type = current_profile.get('opening_type', 'Unknown')
