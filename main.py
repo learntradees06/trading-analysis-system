@@ -27,18 +27,14 @@ from src.portfolio_manager import PortfolioManager
 from src.dashboard import Dashboard
 
 class TradingSystem:
-    def __init__(self):
+    def __init__(self, reports_dir=REPORTS_DIR):
         """Initialize the Trading System"""
         self.ticker = DEFAULT_TICKER
         self.notifier = NotificationManager(DISCORD_WEBHOOK_URL)
         self.dashboard = Dashboard()
         self.watchlist_manager = WatchlistManager()
         self.portfolio_manager = PortfolioManager(self._run_single_ticker_analysis)
-        self._initialize_components()
-
-    def _initialize_components(self):
-        """Initialize components that depend on the current ticker."""
-        pass # No longer needed as components are created on-demand
+        self.reports_dir = reports_dir
 
     def display_menu(self):
         """Display the main menu."""
@@ -236,7 +232,7 @@ class TradingSystem:
     def generate_single_ticker_plan(self):
         """Generate a trading plan and detailed HTML report for the current ticker."""
         print(f"\n--- Generating Plan for {self.ticker} ---")
-        report_generator = ReportGenerator(self.ticker, REPORTS_DIR)
+        report_generator = ReportGenerator(self.ticker, self.reports_dir)
         analysis_result = self._run_single_ticker_analysis(self.ticker, generate_report=True)
         if "error" in analysis_result:
             print(f"\n❌ Error generating trading plan: {analysis_result['error']}"); return
@@ -661,7 +657,9 @@ class TradingSystem:
                 time.sleep(1)
 
 if __name__ == "__main__":
+    # This block is the main entry point when running the script directly
     try:
+        # The reports_dir argument is now available if needed for custom setups
         system = TradingSystem()
         system.run()
     except KeyboardInterrupt:

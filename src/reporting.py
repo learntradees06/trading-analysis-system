@@ -20,11 +20,8 @@ class ReportGenerator:
     def generate_report(self, signal: Dict, current_profile: Dict, developing_profile: Dict, daily_with_indicators: pd.DataFrame,
                         sr_analysis: Dict, ml_predictions: Dict, statistics: Dict, all_data: Dict) -> str:
 
-        from src.sr_levels import SRLevelAnalyzer
-        from src.config import INSTRUMENT_SETTINGS
-        settings = INSTRUMENT_SETTINGS.get(self.ticker, {"tick_size": 0.01})
-        sr_analyzer = SRLevelAnalyzer(self.ticker, settings['tick_size'])
-        fib_levels = sr_analyzer.calculate_fibonacci_levels(all_data['1d'])
+        from src.indicators import calculate_fibonacci_targets
+        fib_targets = calculate_fibonacci_targets(all_data['1d'])
 
         template_vars = {
             'ticker': self.ticker,
@@ -37,8 +34,7 @@ class ReportGenerator:
             'statistics_tables': self._generate_statistics_tables(statistics, current_profile.get('opening_type')),
             'ml_predictions_section': self._generate_ml_predictions_section(ml_predictions, statistics),
             'chart_script': self._generate_price_chart(all_data['1d'], daily_with_indicators, current_profile, sr_analysis, developing_profile),
-            'atr_table': self._generate_atr_table(daily_with_indicators),
-            'fibonacci_table': self._generate_fibonacci_table(fib_levels),
+            'targets_section': self._generate_targets_section(daily_with_indicators, fib_targets),
             'sr_cluster_table': self._generate_sr_cluster_table(sr_analysis),
         }
 
@@ -109,24 +105,27 @@ class ReportGenerator:
             html += self._format_stat_table(f"Probabilities for Predicted '{pred}' Open", statistics, 'broken_during_rth', pred)
         return html
 
-    def _generate_atr_table(self, daily_data: pd.DataFrame) -> str:
-        if 'ATR' not in daily_data.columns: return ""
-        current_atr = daily_data['ATR'].iloc[-1]
-        current_close = daily_data['Close'].iloc[-1]
-        table = f"<h4>ATR Projections</h4><table>" \
-                f"<tr><td>Current ATR (14D)</td><td>{current_atr:.2f}</td></tr>" \
-                f"<tr><td>+1 ATR</td><td>{current_close + current_atr:.2f}</td></tr>" \
-                f"<tr><td>-1 ATR</td><td>{current_close - current_atr:.2f}</td></tr></table>"
-        return table
+    def _generate_targets_section(self, daily_data: pd.DataFrame, fib_targets: Dict) -> str:
+        """Generates HTML for the Expected Targets section."""
+        html = "<h4>ATR Projections</h4>"
+        if 'ATR' in daily_data.columns:
+            current_atr = daily_data['ATR'].iloc[-1]
+            current_close = daily_data['Close'].iloc[-1]
+            html += "<table>"
+            html += f"<tr><td>Bullish Target (+1 ATR)</td><td>{current_close + current_atr:.2f}</td></tr>"
+            html += f"<tr><td>Bearish Target (-1 ATR)</td><td>{current_close - current_atr:.2f}</td></tr>"
+            html += "</table>"
 
-    def _generate_fibonacci_table(self, fib_levels: Dict) -> str:
-        if not fib_levels: return ""
-        table = "<h4>Fibonacci Levels</h4><table><tr><th>Level</th><th>Price</th></tr>"
-        for name, level in fib_levels.items():
-            display_name = name.replace('fib_ext_', 'Ext ').replace('fib_', 'Ret ').replace('_', '.')
-            table += f"<tr><td>{display_name.title()}</td><td>{level:.2f}</td></tr>"
-        table += "</table>"
-        return table
+        html += "<h4>Fibonacci Price Targets</h4>"
+        if fib_targets:
+            html += "<table><tr><th>Level</th><th>Price</th></tr>"
+            for name, level in fib_targets.items():
+                html += f"<tr><td>{name}</td><td>{level:.2f}</td></tr>"
+            html += "</table>"
+        else:
+            html += "<p>Not available.</p>"
+
+        return html
 
     def _generate_sr_cluster_table(self, sr_analysis: Dict) -> str:
         if not sr_analysis or 'all_zones' not in sr_analysis: return ""
@@ -163,34 +162,92 @@ class ReportGenerator:
 
     def _get_html_template(self) -> str:
         return """
-        <!DOCTYPE html><html><head><title>{{ ticker }} Trading Plan</title><style>
-        body{font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Oxygen,Ubuntu,Cantarell,Fira Sans,Droid Sans,Helvetica Neue,sans-serif;margin:0;padding:0;background-color:#f1f5f9;color:#0f172a}
-        .container{max-width:1200px;margin:20px auto;padding:20px;background-color:#fff;border-radius:8px;box-shadow:0 4px 6px rgba(0,0,0,.1)}
-        h1,h2,h3,h4{color:#0f172a}
-        h1{text-align:center;border-bottom:1px solid #cbd5e1;padding-bottom:10px}
-        .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-top:20px}
-        .card{background-color:#f8fafc;padding:20px;border-radius:8px;border:1px solid #e2e8f0}
-        .card.full-width{grid-column:1/-1}
-        table{border-collapse:collapse;width:100%;font-size:.9em}
-        th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}
-        th{background-color:#f1f5f9}
-        .accordion-button{background-color:#f8fafc;color:#0f172a;cursor:pointer;padding:18px;width:100%;border:none;text-align:left;outline:none;font-size:18px;font-weight:600;transition:.4s;border-radius:8px;margin-top:10px;border:1px solid #e2e8f0}
-        .accordion-button:hover{background-color:#f1f5f9}
-        .panel{padding:0 18px;background-color:#fff;max-height:0;overflow:hidden;transition:max-height .2s ease-out}
-        </style></head><body>
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>{{ ticker }} Trading Plan</title>
+            <style>
+                :root {
+                    --bg-color: #f1f5f9; --text-color: #0f172a; --card-bg: #ffffff;
+                    --border-color: #cbd5e1; --header-bg: #e2e8f0; --accent-color: #4f46e5;
+                }
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                    margin: 0; padding: 2rem; background-color: var(--bg-color); color: var(--text-color);
+                }
+                .container {
+                    max-width: 1400px; margin: 0 auto;
+                }
+                h1, h2, h3, h4 { color: var(--text-color); }
+                h1 { text-align: center; border-bottom: 2px solid var(--border-color); padding-bottom: 1rem; margin-bottom: 2rem; }
+                .grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+                    gap: 1.5rem;
+                }
+                .card {
+                    background-color: var(--card-bg);
+                    padding: 1.5rem;
+                    border-radius: 0.75rem;
+                    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+                    border: 1px solid var(--border-color);
+                }
+                .full-width { grid-column: 1 / -1; }
+                table {
+                    border-collapse: collapse; width: 100%; font-size: 0.9em; margin-top: 1rem;
+                }
+                th, td {
+                    border: 1px solid var(--border-color); padding: 0.75rem; text-align: left;
+                }
+                th { background-color: var(--header-bg); font-weight: 600; }
+                tr:nth-child(even) { background-color: #f8fafc; }
+                .accordion-button {
+                    background: var(--accent-color); color: white; cursor: pointer; padding: 1rem;
+                    width: 100%; border: none; text-align: left; outline: none; font-size: 1.25rem;
+                    font-weight: 700; border-radius: 0.5rem; margin-top: 1.5rem;
+                    transition: background-color 0.3s ease;
+                }
+                .accordion-button:hover { background-color: #4338ca; }
+                .panel {
+                    padding: 0 1.5rem; background-color: var(--card-bg);
+                    max-height: 0; overflow: hidden;
+                    transition: max-height 0.3s ease-in-out;
+                    border-radius: 0 0 0.5rem 0.5rem;
+                }
+            </style>
+        </head>
+        <body>
         <div class="container"><h1>{{ ticker }} Trading Plan - {{ timestamp }}</h1>
         <div class="grid">
         <div class="card"><h2>Signal & Context</h2><p><strong>Current Price:</strong> {{ current_price }}</p><p><strong>Prev. Day Open Type:</strong> {{ opening_type }}</p>{{ signal_section }}</div>
         <div class="card"><h2>Key Levels</h2>{{ key_levels_section }}{{ developing_profile_section }}</div>
         <div class="card"><h2>ML Prediction</h2>{{ ml_predictions_section }}</div>
         <div class="card full-width" id="chart">{{ chart_script }}</div>
+        <div class="card"><h3>Expected Targets</h3>{{ targets_section }}</div>
+        <div class="card"><h3>Multi-Timeframe S/R Zones</h3>{{ sr_cluster_table }}</div>
         </div>
-        <button class="accordion-button">Detailed Analysis</button><div class="panel">
-        <div class="grid"><div class="card"><h3>Historical Statistics</h3>{{ statistics_tables }}</div>
-        <div class="card"><h3>ATR & Fibonacci</h3>{{ atr_table }}{{ fibonacci_table }}</div>
-        <div class="card"><h3>S/R Cluster Zones</h3>{{ sr_cluster_table }}</div></div></div>
-        </div><script>
-        var acc=document.getElementsByClassName("accordion-button");
-        for(var i=0;i<acc.length;i++){acc[i].addEventListener("click",function(){this.classList.toggle("active");var panel=this.nextElementSibling;panel.style.maxHeight?panel.style.maxHeight=null:panel.style.maxHeight=panel.scrollHeight+"px"})}
-        </script></body></html>
+        <button class="accordion-button">Detailed Analysis</button>
+        <div class="panel">
+            <div class="grid" style="padding-top: 1.5rem; padding-bottom: 1.5rem;">
+                <div class="card"><h3>Historical Statistics</h3>{{ statistics_tables }}</div>
+            </div>
+        </div>
+        </div>
+        <script>
+            document.querySelectorAll('.accordion-button').forEach(button => {
+                button.addEventListener('click', () => {
+                    const panel = button.nextElementSibling;
+                    button.classList.toggle('active');
+                    if (panel.style.maxHeight) {
+                        panel.style.maxHeight = null;
+                    } else {
+                        panel.style.maxHeight = panel.scrollHeight + "px";
+                    }
+                });
+            });
+        </script>
+        </body>
+        </html>
         """

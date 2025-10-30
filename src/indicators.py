@@ -512,6 +512,50 @@ def calculate_price_patterns(df: pd.DataFrame, window: int = 20) -> Dict[str, pd
         'doji': doji
     }
 
+def calculate_fibonacci_targets(df: pd.DataFrame, lookback: int = 252) -> Dict[str, float]:
+    """
+    Calculate Fibonacci retracement and extension levels for price targets.
+
+    Args:
+        df: DataFrame with OHLC data.
+        lookback: Number of periods to find the swing high/low.
+
+    Returns:
+        Dictionary with Fibonacci levels.
+    """
+    if len(df) < lookback:
+        lookback = len(df)
+
+    recent_data = df.tail(lookback)
+    high_price = recent_data['High'].max()
+    low_price = recent_data['Low'].min()
+
+    high_idx = recent_data['High'].idxmax()
+    low_idx = recent_data['Low'].idxmin()
+
+    swing_range = high_price - low_price
+    if swing_range == 0: return {}
+
+    # Primary trend direction for extensions
+    if high_idx > low_idx: # Uptrend
+        fib_levels = {
+            'Retracement 0.382': high_price - swing_range * 0.382,
+            'Retracement 0.500': high_price - swing_range * 0.500,
+            'Retracement 0.618': high_price - swing_range * 0.618,
+            'Extension 1.272': high_price + swing_range * 0.272,
+            'Extension 1.618': high_price + swing_range * 0.618,
+        }
+    else: # Downtrend
+        fib_levels = {
+            'Retracement 0.382': low_price + swing_range * 0.382,
+            'Retracement 0.500': low_price + swing_range * 0.500,
+            'Retracement 0.618': low_price + swing_range * 0.618,
+            'Extension 1.272': low_price - swing_range * 0.272,
+            'Extension 1.618': low_price - swing_range * 0.618,
+        }
+
+    return fib_levels
+
 def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calculate all technical indicators and add them to the dataframe
