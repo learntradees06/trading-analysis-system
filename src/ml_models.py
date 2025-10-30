@@ -222,14 +222,16 @@ class MLPredictor:
         joblib.dump(self.model, self.models_dir / f"{self.ticker}_opening_type_model.pkl")
         joblib.dump(self.scaler, self.models_dir / f"{self.ticker}_opening_type_scaler.pkl")
         joblib.dump(self.encoder, self.models_dir / f"{self.ticker}_opening_type_encoder.pkl")
+        joblib.dump(self.feature_cols, self.models_dir / f"{self.ticker}_opening_type_features.pkl")
         logger.info(f"Successfully saved model for {self.ticker}")
 
     def load_model(self) -> bool:
         model_path = self.models_dir / f"{self.ticker}_opening_type_model.pkl"
         scaler_path = self.models_dir / f"{self.ticker}_opening_type_scaler.pkl"
         encoder_path = self.models_dir / f"{self.ticker}_opening_type_encoder.pkl"
+        features_path = self.models_dir / f"{self.ticker}_opening_type_features.pkl"
 
-        if not model_path.exists() or not scaler_path.exists() or not encoder_path.exists():
+        if not all(p.exists() for p in [model_path, scaler_path, encoder_path, features_path]):
             logger.warning(f"Model files not found for {self.ticker}")
             return False
 
@@ -237,8 +239,7 @@ class MLPredictor:
             self.model = joblib.load(model_path)
             self.scaler = joblib.load(scaler_path)
             self.encoder = joblib.load(encoder_path)
-            if hasattr(self.model, 'feature_names_in_'):
-                 self.feature_cols = self.model.feature_names_in_
+            self.feature_cols = joblib.load(features_path)
             self.is_trained = True
             logger.info(f"Successfully loaded pre-trained model for {self.ticker}")
             return True
